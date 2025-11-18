@@ -48,31 +48,36 @@ def compute_B(c_model, rho_model, rho_stag_x, rho_stag_y):
 def create_compliance_matrix_isotropic(lambda_param, mu):
     """Create the compliance matrix S for isotropic elastic material.
     
-    The compliance matrix relates strain to stress: epsilon = S * sigma.
-    For isotropic materials, S depends on Lamé parameters λ and μ.
+    The compliance matrix relates strain to stress: ε(x) = S(x)σ(x).
+    For isotropic materials, S is the inverse of the stiffness matrix C.
+    
+    S(x) = C^-1 where C is:
+        [ λ+2μ   λ      λ      0   0   0 ]
+        [ λ      λ+2μ   λ      0   0   0 ]
+        [ λ      λ      λ+2μ   0   0   0 ]
+        [ 0      0      0      μ   0   0 ]
+        [ 0      0      0      0   μ   0 ]
+        [ 0      0      0      0   0   μ ]
     
     Args:
-        lambda_param: First Lamé parameter
-        mu: Second Lamé parameter (shear modulus)
+        lambda_param: First Lamé parameter (λ)
+        mu: Second Lamé parameter (μ, shear modulus)
     
     Returns:
         S: 6x6 compliance matrix
     """
-    # Compute elastic constants in terms of Lamé parameters
-    E = mu * (3*lambda_param + 2*mu) / (lambda_param + mu)  # Young's modulus
-    nu = lambda_param / (2*(lambda_param + mu))  # Poisson's ratio
+    # Construct stiffness matrix C
+    C = np.array([
+        [lambda_param + 2*mu, lambda_param, lambda_param, 0, 0, 0],
+        [lambda_param, lambda_param + 2*mu, lambda_param, 0, 0, 0],
+        [lambda_param, lambda_param, lambda_param + 2*mu, 0, 0, 0],
+        [0, 0, 0, mu, 0, 0],
+        [0, 0, 0, 0, mu, 0],
+        [0, 0, 0, 0, 0, mu]
+    ])
     
-    # Construct compliance matrix (inverse of stiffness matrix) for isotropic materials
-    S = np.zeros((6, 6))
-    
-    # Diagonal terms
-    S[0, 0] = S[1, 1] = S[2, 2] = 1/E
-    S[3, 3] = S[4, 4] = S[5, 5] = 1/(2*mu)
-    
-    # Off-diagonal terms (coupling between normal stresses)
-    S[0, 1] = S[0, 2] = -nu/E
-    S[1, 0] = S[1, 2] = -nu/E
-    S[2, 0] = S[2, 1] = -nu/E
+    # Compliance matrix is the inverse of stiffness matrix
+    S = np.linalg.inv(C)
     
     return S
 
