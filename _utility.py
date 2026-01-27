@@ -995,3 +995,31 @@ def plot_field_3D(state):
     )
 
     return fig
+
+def subspaceProjector(staggered_grid_size, subspace_points=None):
+    '''
+    Return a numpy array corresponding to the staggered grid points included in the subspace projector.
+    :param subspace_points: currently assumed to be a numpy array of length staggered_grid_size. Each entry has value 0 (not in subspace) and 1 (in subspace).
+    :param staggered_grid_size: nonnegative integer.
+    '''
+    # If no input for points, randomly select subspace points.
+    if subspace_points == None:
+        valid_prob = False
+        # Probability of each point to be included in the subspace must be a float between 0 and 1.
+        while valid_prob == False:
+            prob = input("Enter a probability of each point being included in the subspace: ")
+            try:
+                prob = float(prob)
+                if (0 <= prob <= 1):
+                    valid_prob = True
+                else:
+                    print("Probability must be between 0 and 1.")
+            except:
+                print("Invalid input. Not a float?")
+        mask = np.random.choice([0, 1], size=staggered_grid_size, p=[1-prob, prob])
+    else:
+        # If subspace_points is a numpy array, check if the number of points is equal to staggered_grid_size.
+        assert len(subspace_points) == staggered_grid_size
+        # The part below will be modified if subspace_points is not a numpy array.
+        mask = subspace_points
+    return mask
