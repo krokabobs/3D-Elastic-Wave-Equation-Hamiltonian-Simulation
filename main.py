@@ -1,16 +1,140 @@
 import numpy as np
 from _utility import *
 
-# Create compliance matrix from wave velocities
-c_p = 6000  # P-wave velocity (m/s)
-c_s = 3500  # S-wave velocity (m/s)
-rho = 2700  # Density (kg/m^3)
-S = create_compliance_matrix_from_velocities(c_p, c_s, rho)
+# ===== MATERIAL PROPERTIES =====
+# Base material properties
+c_p_base = 6000  # P-wave velocity (m/s)
+c_s_base = 3500  # S-wave velocity (m/s)
+rho_base = 2700  # Base density (kg/m^3)
+
+S_base = create_compliance_matrix_from_velocities(c_p_base, c_s_base, rho_base)
 
 # Set up 3D grid
 Nx, Ny, Nz = 8, 8, 8  
 dx = dy = dz = 0.05  
-rho_model = rho * np.ones((Nz, Ny, Nx))
+
+# Create coordinate arrays
+x = np.arange(Nx) * dx - (Nx-1)*dx/2
+y = np.arange(Ny) * dy - (Ny-1)*dy/2
+z = np.arange(Nz) * dz - (Nz-1)*dz/2
+X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+
+# ===== ADD FRACTURE PLANES =====
+# Fractures are represented as intersecting planes with different material properties
+
+ADD_FRACTURES = True  # Set to False to disable fractures
+
+# Compute base material Lamé parameters
+mu_base = rho_base * c_s_base**2  # Shear modulus
+lambda_base = rho_base * c_p_base**2 - 2*mu_base  # First Lamé parameter
+
+# Initialize fracture properties (will be set based on method)
+lambda_fracture = None
+mu_fracture = None
+rho_fracture = None
+
+# For air-filled fractures: very low stiffness
+# For fluid-filled: use fluid properties
+# For damaged rock: reduced but not zero stiffness
+FRACTURE_LAMBDA_RATIO = 0.01  # Fracture λ = 1% of λ
+FRACTURE_MU_RATIO = 0.01      # Fracture μ = 1% of μ
+lambda_fracture = FRACTURE_LAMBDA_RATIO * lambda_base
+mu_fracture = FRACTURE_MU_RATIO * mu_base
+# Density for fractures (e.g., air ≈ 1.2 kg/m³, water ≈ 1000 kg/m³)
+rho_fracture = 1.2  # Air-filled fracture (or use 1000 for water-filled)
+print(f"\nFracture properties (Lamé parameters directly):")
+print(f"  λ_fracture = {lambda_fracture:.2e} Pa ({FRACTURE_LAMBDA_RATIO*100:.1f}% of λ)")
+print(f"  μ_fracture = {mu_fracture:.2e} Pa ({FRACTURE_MU_RATIO*100:.1f}% of μ)")
+print(f"  ρ_fracture = {rho_fracture:.1f} kg/m³ (air-filled)")
+
+# Initialize density model with base density (homogeneous material)
+rho_model = np.full((Nz, Ny, Nx), rho_base)
+
+# Initialize fracture mask
+fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
+
+if ADD_FRACTURES:
+    # Define fracture planes (intersecting planes)
+    fracture1_z = Nz // 2  # Horizontal plane
+    fracture2_x = Nx // 2  # Vertical plane (x-direction)
+    fracture3_y = Ny // 2  # Vertical plane (y-direction)
+    fracture_thickness = 0  # Single cell thick
+    
+    print(f"\nAdding fracture planes:")
+    print(f"  Fracture 1: Horizontal plane at z-index {fracture1_z} ± {fracture_thickness}")
+    print(f"  Fracture 2: Vertical plane at x-index {fracture2_x} ± {fracture_thickness}")
+    print(f"  Fracture 3: Vertical plane at y-index {fracture3_y} ± {fracture_thickness}")
+    
+    # Create fracture mask
+    fracture_cells = 0
+    
+    for i in range(Nz):
+        for j in range(Ny):
+            for k in range(Nx):
+                is_fracture = False
+                
+                if abs(i - fracture1_z) <= fracture_thickness:
+                    is_fracture = True
+                if abs(k - fracture2_x) <= fracture_thickness:
+                    is_fracture = True
+                if abs(j - fracture3_y) <= fracture_thickness:
+                    is_fracture = True
+                
+                if is_fracture:
+                    fracture_mask[i, j, k] = True
+                    fracture_cells += 1
+                    # Set fracture density (air-filled)
+                    rho_model[i, j, k] = rho_fracture
+    
+    print(f"  Total fracture cells: {fracture_cells} out of {Nx*Ny*Nz} ({100*fracture_cells/(Nx*Ny*Nz):.1f}%)")
+
+# Clip density to reasonable bounds (allow air density ~1.2 kg/m³)
+rho_min, rho_max = 1.0, 3000  
+rho_model = np.clip(rho_model, rho_min, rho_max)
+
+# Print density statistics
+print(f"\nDensity Model Statistics:")
+print(f"  Min density: {np.min(rho_model):.1f} kg/m³")
+print(f"  Max density: {np.max(rho_model):.1f} kg/m³")
+print(f"  Mean density: {np.mean(rho_model):.1f} kg/m³")
+print(f"  Std deviation: {np.std(rho_model):.1f} kg/m³")
+print(f"  Variation: {(np.max(rho_model) - np.min(rho_model)) / np.mean(rho_model) * 100:.1f}%")
+if ADD_FRACTURES:
+    # Note: fracture_mask was already created in the fracture section above
+    if np.any(fracture_mask):
+        print(f"\n  Fracture regions:")
+        print(f"    Fracture density range: {np.min(rho_model[fracture_mask]):.1f} - {np.max(rho_model[fracture_mask]):.1f} kg/m³")
+        print(f"    Matrix density range: {np.min(rho_model[~fracture_mask]):.1f} - {np.max(rho_model[~fracture_mask]):.1f} kg/m³")
+
+# Check if we need spatially varying S matrix
+need_varying_S = ADD_FRACTURES
+
+if need_varying_S:
+    # Create spatially varying compliance matrix (6, 6, Nz, Ny, Nx)
+    S_model = np.zeros((6, 6, Nz, Ny, Nx))
+    
+    print(f"\nCreating spatially varying compliance matrix...")
+    
+    for i in range(Nz):
+        for j in range(Ny):
+            for k in range(Nx):
+                if ADD_FRACTURES and fracture_mask[i, j, k]:
+                    S_model[:, :, i, j, k] = create_compliance_matrix_isotropic(
+                        lambda_fracture, mu_fracture
+                    )
+                else:
+                    # Use base material properties
+                    S_model[:, :, i, j, k] = S_base
+    
+    S = S_model
+    
+    if ADD_FRACTURES:
+        print(f"  Fracture regions use Lamé parameters: λ={lambda_fracture:.2e}, μ={mu_fracture:.2e} Pa")
+        print(f"  Matrix regions use base properties: λ={lambda_base:.2e}, μ={mu_base:.2e} Pa")
+else:
+    # Use constant compliance matrix (simpler, faster)
+    S = S_base
+    print(f"\nUsing constant elastic properties (c_p={c_p_base} m/s, c_s={c_s_base} m/s)")
 
 # Calculate staggered grid sizes
 N_main = Nx * Ny * Nz
@@ -83,10 +207,25 @@ print(f"Initial condition created. Max stress: {np.max(np.abs(phi_0)):.6f}")
 # dφ/dt = -iH·φ  =>  φ(t) = exp(-iHt)·φ(0)
 from scipy.sparse.linalg import expm_multiply
 
-# CFL condition: dt < dx / c_p for stability
-# Use smaller time step for better energy conservation
-dt_max = dx / c_p  # Maximum stable time step
-dt = 0.1 * dt_max 
+# CFL condition: dt < dx / c_p_min for stability
+# Use the MINIMUM P-wave velocity to ensure stability everywhere
+# (fractures have lower velocity, so we need smaller time step)
+if need_varying_S and ADD_FRACTURES:
+    # Compute P-wave velocity in fracture regions
+    # c_p = sqrt((λ + 2μ)/ρ)
+    c_p_fracture = np.sqrt((lambda_fracture + 2*mu_fracture) / rho_fracture)
+    # Use the minimum velocity (fracture) for stability
+    c_p_min = min(c_p_fracture, c_p_base)
+    print(f"\nVelocity analysis for CFL condition:")
+    print(f"  Matrix P-wave velocity: {c_p_base:.1f} m/s")
+    print(f"  Fracture P-wave velocity: {c_p_fracture:.1f} m/s")
+    print(f"  Using minimum velocity for CFL: {c_p_min:.1f} m/s")
+else:
+    c_p_min = c_p_base  # Use base velocity when constant
+    print(f"\nVelocity analysis for CFL condition:")
+    print(f"  Using constant P-wave velocity: {c_p_min:.1f} m/s")
+dt_max = dx / c_p_min  # Maximum stable time step (CFL limit)
+dt = 0.1 * dt_max  # Use 10% of maximum for safety 
 n_steps = 20  
 t_final = n_steps * dt
 
@@ -134,7 +273,7 @@ print(f"  Stress magnitude: max={max(np.max(np.abs(σ_xx)), np.max(np.abs(σ_yy)
 # Visualize the evolved wave
 output_file = "elastic_3D_simulation.png"
 plot_elastic_3D(phi_real, Nx, Ny, Nz, dx, dy, dz, 
-                title=f'3D Elastic Wave (t={t_final:.2e}s) (Staggered Grid)',
+                title=f'3D Elastic Wave (t={t_final:.2e}s) - Staggered Grid',
                 save_file=output_file,
                 subsample=2,  
                 scale_v=20,  
