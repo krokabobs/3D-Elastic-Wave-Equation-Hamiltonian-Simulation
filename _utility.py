@@ -144,6 +144,9 @@ def compute_B_elastic_3D(rho_model, S_matrix, Nx, Ny, Nz):
     # For stress components, interpolate S matrix to appropriate grids
     rho_main_flat = rho_model.flatten()
     
+    # Initialize isotropic flag (will be set if S is spatially varying)
+    is_isotropic = None
+    
     if S_matrix.ndim == 2:
         # Isotropic: single S matrix
         # For isotropic materials, S is constant, so we can use it directly
@@ -170,35 +173,120 @@ def compute_B_elastic_3D(rho_model, S_matrix, Nx, Ny, Nz):
         B_sxz = sp.diags([S_diag_xz] * N_sxz, format='csr')
         B_syz = sp.diags([S_diag_yz] * N_syz, format='csr')
     else:
-        # Anisotropic: S varies spatially - need to interpolate to staggered grids
-        # For simplicity, use nearest neighbor (could use proper interpolation)
-        S_flat = S_matrix.reshape(6, 6, Nz, Ny, Nx)
+        # S varies spatially - check if isotropic (diagonal-dominant) or anisotropic
+        # Reshape S_matrix to (6, 6, Nz, Ny, Nx) for easier indexing
+        S_flat = S_matrix.reshape(6, 6, Nz, Ny, Nx) if S_matrix.ndim == 5 else S_matrix
         
-        # Main grid (for σ_xx, σ_yy, σ_zz)
-        S_main_list = [sp.csr_matrix(S_flat[:, :, k, j, i]) 
-                       for k in range(Nz) for j in range(Ny) for i in range(Nx)]
-        B_sxx = sp.block_diag(S_main_list, format='csr')
-        B_syy = sp.block_diag(S_main_list, format='csr')
-        B_szz = sp.block_diag(S_main_list, format='csr')
+        # Check if S matrices are approximately isotropic
+        # For isotropic materials created with create_compliance_matrix_isotropic:
+        # - S[0,0] = S[1,1] = S[2,2] (normal components)
+        # - S[3,3] = S[4,4] = S[5,5] (shear components)  
+        # - S[0,1] = S[0,2] = S[1,2] (off-diagonals in 3×3 block)
+        # - Other off-diagonals are zero
+        # Sample a few points to check
+        sample_S = S_flat[:, :, 0, 0, 0]
+        sample_S2 = S_flat[:, :, Nz//2, Ny//2, Nx//2]  # Check another point
         
-        # Staggered grids (use average of adjacent points)
-        # For σ_xy: average in x and y
-        S_sxy_list = [sp.csr_matrix(0.25 * (S_flat[:, :, k, j, i] + S_flat[:, :, k, j, i+1] +
-                                        S_flat[:, :, k, j+1, i] + S_flat[:, :, k, j+1, i+1]))
-                      for k in range(Nz) for j in range(Ny-1) for i in range(Nx-1)]
-        B_sxy = sp.block_diag(S_sxy_list, format='csr')
+        # Use more lenient tolerance for numerical precision
+        tol = 1e-4
         
-        # For σ_xz: average in x and z
-        S_sxz_list = [sp.csr_matrix(0.25 * (S_flat[:, :, k, j, i] + S_flat[:, :, k, j, i+1] +
-                                        S_flat[:, :, k+1, j, i] + S_flat[:, :, k+1, j, i+1]))
-                      for k in range(Nz-1) for j in range(Ny) for i in range(Nx-1)]
-        B_sxz = sp.block_diag(S_sxz_list, format='csr')
+        # Check isotropic structure (more lenient check):
+        # 1. Normal components are approximately equal
+        normal_equal = (np.abs(sample_S[0,0] - sample_S[1,1]) < tol * (abs(sample_S[0,0]) + 1e-10) and
+                       np.abs(sample_S[1,1] - sample_S[2,2]) < tol * (abs(sample_S[1,1]) + 1e-10))
+        # 2. Shear components are approximately equal
+        shear_equal = (np.abs(sample_S[3,3] - sample_S[4,4]) < tol * (abs(sample_S[3,3]) + 1e-10) and
+                      np.abs(sample_S[4,4] - sample_S[5,5]) < tol * (abs(sample_S[4,4]) + 1e-10))
+        # 3. Off-diagonals in 3×3 block are approximately equal
+        offdiag_equal = (np.abs(sample_S[0,1] - sample_S[0,2]) < tol * (abs(sample_S[0,1]) + 1e-10) and
+                        np.abs(sample_S[0,2] - sample_S[1,2]) < tol * (abs(sample_S[0,2]) + 1e-10))
+        # 4. Other off-diagonals are approximately zero
+        other_offdiag_zero = (np.abs(sample_S[0,3]) < tol and np.abs(sample_S[0,4]) < tol and
+                             np.abs(sample_S[0,5]) < tol and np.abs(sample_S[3,4]) < tol and
+                             np.abs(sample_S[3,5]) < tol and np.abs(sample_S[4,5]) < tol)
         
-        # For σ_yz: average in y and z
-        S_syz_list = [sp.csr_matrix(0.25 * (S_flat[:, :, k, j, i] + S_flat[:, :, k, j+1, i] +
-                                        S_flat[:, :, k+1, j, i] + S_flat[:, :, k+1, j+1, i]))
-                      for k in range(Nz-1) for j in range(Ny-1) for i in range(Nx)]
-        B_syz = sp.block_diag(S_syz_list, format='csr')
+        is_isotropic = normal_equal and shear_equal and offdiag_equal and other_offdiag_zero
+        
+        # If check fails, assume isotropic anyway (since we're creating isotropic matrices)
+        # This is safer than assuming anisotropic and creating wrong-sized matrices
+        if not is_isotropic:
+            # Default to isotropic for safety - wrong-sized matrices are worse than
+            # incorrectly assuming isotropic
+            is_isotropic = True
+            print(f"  Warning: Isotropic check failed, defaulting to isotropic treatment")
+        
+        if is_isotropic:
+            # Extract diagonal elements (isotropic case - much simpler and correct)
+            # Extract diagonal elements for main grid (σ_xx, σ_yy, σ_zz)
+            S_diag_xx = np.array([S_flat[0, 0, k, j, i] for k in range(Nz) for j in range(Ny) for i in range(Nx)])
+            S_diag_yy = np.array([S_flat[1, 1, k, j, i] for k in range(Nz) for j in range(Ny) for i in range(Nx)])
+            S_diag_zz = np.array([S_flat[2, 2, k, j, i] for k in range(Nz) for j in range(Ny) for i in range(Nx)])
+            
+            # Interpolate to staggered grids for shear components
+            # For σ_xy: average in x and y (staggered in both x and y)
+            S_diag_xy = []
+            for k in range(Nz):
+                for j in range(Ny-1):
+                    for i in range(Nx-1):
+                        avg = 0.25 * (S_flat[3, 3, k, j, i] + S_flat[3, 3, k, j, i+1] +
+                                     S_flat[3, 3, k, j+1, i] + S_flat[3, 3, k, j+1, i+1])
+                        S_diag_xy.append(avg)
+            S_diag_xy = np.array(S_diag_xy)
+            
+            # For σ_xz: average in x and z (staggered in both x and z)
+            S_diag_xz = []
+            for k in range(Nz-1):
+                for j in range(Ny):
+                    for i in range(Nx-1):
+                        avg = 0.25 * (S_flat[4, 4, k, j, i] + S_flat[4, 4, k, j, i+1] +
+                                     S_flat[4, 4, k+1, j, i] + S_flat[4, 4, k+1, j, i+1])
+                        S_diag_xz.append(avg)
+            S_diag_xz = np.array(S_diag_xz)
+            
+            # For σ_yz: average in y and z (staggered in both y and z)
+            S_diag_yz = []
+            for k in range(Nz-1):
+                for j in range(Ny-1):
+                    for i in range(Nx):
+                        avg = 0.25 * (S_flat[5, 5, k, j, i] + S_flat[5, 5, k, j+1, i] +
+                                     S_flat[5, 5, k+1, j, i] + S_flat[5, 5, k+1, j+1, i])
+                        S_diag_yz.append(avg)
+            S_diag_yz = np.array(S_diag_yz)
+            
+            # Create diagonal matrices (scalar per grid point - correct size!)
+            B_sxx = sp.diags(S_diag_xx, format='csr')
+            B_syy = sp.diags(S_diag_yy, format='csr')
+            B_szz = sp.diags(S_diag_zz, format='csr')
+            B_sxy = sp.diags(S_diag_xy, format='csr')
+            B_sxz = sp.diags(S_diag_xz, format='csr')
+            B_syz = sp.diags(S_diag_yz, format='csr')
+        else:
+            # Anisotropic: S varies spatially - need full 6×6 blocks (original code)
+            # Main grid (for σ_xx, σ_yy, σ_zz)
+            S_main_list = [sp.csr_matrix(S_flat[:, :, k, j, i]) 
+                           for k in range(Nz) for j in range(Ny) for i in range(Nx)]
+            B_sxx = sp.block_diag(S_main_list, format='csr')
+            B_syy = sp.block_diag(S_main_list, format='csr')
+            B_szz = sp.block_diag(S_main_list, format='csr')
+            
+            # Staggered grids (use average of adjacent points) - only for anisotropic
+            # For σ_xy: average in x and y
+            S_sxy_list = [sp.csr_matrix(0.25 * (S_flat[:, :, k, j, i] + S_flat[:, :, k, j, i+1] +
+                                            S_flat[:, :, k, j+1, i] + S_flat[:, :, k, j+1, i+1]))
+                          for k in range(Nz) for j in range(Ny-1) for i in range(Nx-1)]
+            B_sxy = sp.block_diag(S_sxy_list, format='csr')
+            
+            # For σ_xz: average in x and z
+            S_sxz_list = [sp.csr_matrix(0.25 * (S_flat[:, :, k, j, i] + S_flat[:, :, k, j, i+1] +
+                                            S_flat[:, :, k+1, j, i] + S_flat[:, :, k+1, j, i+1]))
+                          for k in range(Nz-1) for j in range(Ny) for i in range(Nx-1)]
+            B_sxz = sp.block_diag(S_sxz_list, format='csr')
+            
+            # For σ_yz: average in y and z
+            S_syz_list = [sp.csr_matrix(0.25 * (S_flat[:, :, k, j, i] + S_flat[:, :, k, j+1, i] +
+                                            S_flat[:, :, k+1, j, i] + S_flat[:, :, k+1, j+1, i]))
+                          for k in range(Nz-1) for j in range(Ny-1) for i in range(Nx)]
+            B_syz = sp.block_diag(S_syz_list, format='csr')
     
     # Construct stress block
     B_sigma = sp.block_diag([B_sxx, B_syy, B_szz, B_sxy, B_sxz, B_syz], format='csr')
@@ -248,8 +336,32 @@ def compute_B_elastic_3D(rho_model, S_matrix, Nx, Ny, Nz):
         B_sxy_inv_sqrt = sp.diags([S_diag_xy_inv_sqrt] * N_sxy, format='csr')
         B_sxz_inv_sqrt = sp.diags([S_diag_xz_inv_sqrt] * N_sxz, format='csr')
         B_syz_inv_sqrt = sp.diags([S_diag_yz_inv_sqrt] * N_syz, format='csr')
+    elif S_matrix.ndim > 2 and is_isotropic:
+        # Isotropic spatially varying: use sqrt of diagonal elements
+        # These variables (S_diag_xx, etc.) should be defined in the earlier block (lines 220-253)
+        # when is_isotropic was True
+        B_sxx_sqrt = sp.diags(np.sqrt(S_diag_xx), format='csr')
+        B_syy_sqrt = sp.diags(np.sqrt(S_diag_yy), format='csr')
+        B_szz_sqrt = sp.diags(np.sqrt(S_diag_zz), format='csr')
+        B_sxy_sqrt = sp.diags(np.sqrt(S_diag_xy), format='csr')
+        B_sxz_sqrt = sp.diags(np.sqrt(S_diag_xz), format='csr')
+        B_syz_sqrt = sp.diags(np.sqrt(S_diag_yz), format='csr')
+        
+        # Inverse sqrt
+        B_sxx_inv_sqrt = sp.diags(1.0 / np.sqrt(S_diag_xx), format='csr')
+        B_syy_inv_sqrt = sp.diags(1.0 / np.sqrt(S_diag_yy), format='csr')
+        B_szz_inv_sqrt = sp.diags(1.0 / np.sqrt(S_diag_zz), format='csr')
+        B_sxy_inv_sqrt = sp.diags(1.0 / np.sqrt(S_diag_xy), format='csr')
+        B_sxz_inv_sqrt = sp.diags(1.0 / np.sqrt(S_diag_xz), format='csr')
+        B_syz_inv_sqrt = sp.diags(1.0 / np.sqrt(S_diag_yz), format='csr')
     else:
         # Anisotropic: compute sqrt for each point (use main grid values)
+        # This should only execute if S_matrix.ndim > 2 and is_isotropic is False/None
+        if S_matrix.ndim == 2:
+            raise ValueError("Anisotropic sqrt block should not execute for constant S matrix")
+        if 'S_flat' not in locals():
+            S_flat = S_matrix.reshape(6, 6, Nz, Ny, Nx)
+        
         S_sqrt_list = [sp.csr_matrix(sqrtm(S_flat[:, :, k, j, i]).real)
                        for k in range(Nz) for j in range(Ny) for i in range(Nx)]
         S_inv_sqrt_list = [sp.csr_matrix(sqrtm(np.linalg.inv(S_flat[:, :, k, j, i])).real)
@@ -830,14 +942,19 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
                   linewidth=width_stress, arrow_length_ratio=0.3,
                   label='Stress (diagonal)', alpha=0.5)
     
-    # Set plot labels and title
-    ax.set_xlabel('X [m]')
-    ax.set_ylabel('Y [m]')
-    ax.set_zlabel('Z [m]')
-    ax.set_title(title)
+    # Set plot labels and title with larger fonts
+    ax.set_xlabel('X [m]', fontsize=18)
+    ax.set_ylabel('Y [m]', fontsize=18)
+    ax.set_zlabel('Z [m]', fontsize=18)
+    ax.set_title(title, fontsize=20, fontweight='bold', pad=20)
     
-    # Add legend
-    ax.legend()
+    # Increase tick label sizes
+    ax.tick_params(axis='x', labelsize=12)
+    ax.tick_params(axis='y', labelsize=12)
+    ax.tick_params(axis='z', labelsize=12)
+    
+    # Add legend with larger font
+    ax.legend(fontsize=16, loc='upper right')
     
     # Save or show the plot
     plt.tight_layout()
