@@ -5,6 +5,34 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
+'''
+Functions in this utility file:
+check_file: To see what version has been imported
+Gaussian: source function producing a 3D Gaussian Source
+Ricker: source function producing a 3D Ricker Wavelet
+FD: finite difference operator (first order backward difference with negative sign on in)
+compute_B: 2D acoustic B operator
+create_compliance_matrix_isotropic: creates S(x) from mu and lambda
+create_compliance_matrix_from_velocities: creates S(x) from P and S wave velocities
+rho_model_compliance_matrix: returns S(x) and the rho_model vector for fractures
+compute_B_elastic_3D: computes B operator for 3D elastic wave equation
+FD_solver_2D: Gives H, B, A, etc for 2D acoustic
+FD_solver_3D_elastic: Gives H, B, A etc for 3D elastic
+FD_solver_2D_quantum: Pads H, A, B, etc with zeros for Hamiltonian Simulation
+FD_solver_3D_quantum: Pads H, A, B, etc with zeros for Hamiltonian Simulation
+compute_source_2D: source for acoustic
+compute_source_3D_elastic: source for elastic
+plot_acoustic_2D: plots 2D acoustic wave field
+plot_elastic_3D: plots 3D elastic wave field
+phi_to_fields_main_grid:interpolates values to main grid
+plot_elastic_3D_interactive: interactive plots for 3D wave field
+plot_maxwells_3D: maxwells 3D plots
+plot_field_3D:3D plotting function
+subpace_Projector: gives mask for subspace projector 
+'''
+
+def check_file():
+    return "recent"
 # -------- Functions --------
 # -- Source Functions --
 def Gaussian(f, x, y, z, x0=0, y0=0, z0=0):
@@ -104,7 +132,7 @@ def rho_model_compliance_matrix(Nx,Ny,Nz,dx,dy,dz,ADD_FRACTURES):
     rho_base = 2700  # Base density (kg/m³)
     S_base = create_compliance_matrix_from_velocities(c_p_base, c_s_base, rho_base)
 
-    ADD_FRACTURES = True
+    #ADD_FRACTURES = True
 
     # Fracture properties (water-filled fractures)
     rho_fracture = 1000.0  # Water density (kg/m³)
@@ -877,6 +905,7 @@ def plot_acoustic_2D(phi, Nx, Ny, dx, dy, title='2D Wave Field', subsample=16, s
     # Show the plot
     plt.show()
 
+
 def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
                     title='3D Elastic Wave Field',
                     subsample=4, scale_v=1.5, scale_stress=0.5,
@@ -884,9 +913,9 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
                     show_velocity=True, show_stress=True,
                     save_file=None):
     """Plot velocity and stress fields for the 3D elastic wave equation.
-    
+
     State vector: [v_x, v_y, v_z, σ_xx, σ_yy, σ_zz, σ_xy, σ_xz, σ_yz]
-    
+
     Args:
         phi: State vector
         Nx, Ny, Nz: Number of grid points
@@ -903,64 +932,64 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
     """
     # Staggered grid sizes
     N_main = Nx * Ny * Nz
-    N_vx = (Nx-1) * Ny * Nz
-    N_vy = Nx * (Ny-1) * Nz
-    N_vz = Nx * Ny * (Nz-1)
-    N_sxy = (Nx-1) * (Ny-1) * Nz
-    N_sxz = (Nx-1) * Ny * (Nz-1)
-    N_syz = Nx * (Ny-1) * (Nz-1)
-    
+    N_vx = (Nx - 1) * Ny * Nz
+    N_vy = Nx * (Ny - 1) * Nz
+    N_vz = Nx * Ny * (Nz - 1)
+    N_sxy = (Nx - 1) * (Ny - 1) * Nz
+    N_sxz = (Nx - 1) * Ny * (Nz - 1)
+    N_syz = Nx * (Ny - 1) * (Nz - 1)
+
     # Extract velocity components (staggered grids)
     idx = 0
-    v_x = phi[idx:idx+N_vx].reshape(Nz, Ny, Nx-1)
+    v_x = phi[idx:idx + N_vx].reshape(Nz, Ny, Nx - 1)
     idx += N_vx
-    v_y = phi[idx:idx+N_vy].reshape(Nz, Ny-1, Nx)
+    v_y = phi[idx:idx + N_vy].reshape(Nz, Ny - 1, Nx)
     idx += N_vy
-    v_z = phi[idx:idx+N_vz].reshape(Nz-1, Ny, Nx)
+    v_z = phi[idx:idx + N_vz].reshape(Nz - 1, Ny, Nx)
     idx += N_vz
-    
+
     # Extract stress components
-    sigma_xx = phi[idx:idx+N_main].reshape(Nz, Ny, Nx)
+    sigma_xx = phi[idx:idx + N_main].reshape(Nz, Ny, Nx)
     idx += N_main
-    sigma_yy = phi[idx:idx+N_main].reshape(Nz, Ny, Nx)
+    sigma_yy = phi[idx:idx + N_main].reshape(Nz, Ny, Nx)
     idx += N_main
-    sigma_zz = phi[idx:idx+N_main].reshape(Nz, Ny, Nx)
+    sigma_zz = phi[idx:idx + N_main].reshape(Nz, Ny, Nx)
     idx += N_main
-    sigma_xy = phi[idx:idx+N_sxy].reshape(Nz, Ny-1, Nx-1)
+    sigma_xy = phi[idx:idx + N_sxy].reshape(Nz, Ny - 1, Nx - 1)
     idx += N_sxy
-    sigma_xz = phi[idx:idx+N_sxz].reshape(Nz-1, Ny, Nx-1)
+    sigma_xz = phi[idx:idx + N_sxz].reshape(Nz - 1, Ny, Nx - 1)
     idx += N_sxz
-    sigma_yz = phi[idx:idx+N_syz].reshape(Nz-1, Ny-1, Nx)
-    
+    sigma_yz = phi[idx:idx + N_syz].reshape(Nz - 1, Ny - 1, Nx)
+
     # Interpolate staggered fields to main grid for visualization
     # For v_x: staggered in x, so average with neighbors
     v_x_main = np.zeros((Nz, Ny, Nx))
     v_x_main[:, :, 0] = v_x[:, :, 0]  # Left boundary
     v_x_main[:, :, -1] = v_x[:, :, -1]  # Right boundary
     v_x_main[:, :, 1:-1] = 0.5 * (v_x[:, :, :-1] + v_x[:, :, 1:])  # Interior: average
-    
+
     # For v_y: staggered in y
     v_y_main = np.zeros((Nz, Ny, Nx))
     v_y_main[:, 0, :] = v_y[:, 0, :]  # Top boundary
     v_y_main[:, -1, :] = v_y[:, -1, :]  # Bottom boundary
     v_y_main[:, 1:-1, :] = 0.5 * (v_y[:, :-1, :] + v_y[:, 1:, :])  # Interior: average
-    
+
     # For v_z: staggered in z
     v_z_main = np.zeros((Nz, Ny, Nx))
     v_z_main[0, :, :] = v_z[0, :, :]  # Front boundary
     v_z_main[-1, :, :] = v_z[-1, :, :]  # Back boundary
     v_z_main[1:-1, :, :] = 0.5 * (v_z[:-1, :, :] + v_z[1:, :, :])  # Interior: average
-    
+
     # For stress on staggered grids, use nearest neighbor (simpler for visualization)
     sigma_xy_main = np.zeros((Nz, Ny, Nx))
     sigma_xy_main[:, 1:, 1:] = sigma_xy  # Place at lower-right of cell
-    
+
     sigma_xz_main = np.zeros((Nz, Ny, Nx))
     sigma_xz_main[1:, :, 1:] = sigma_xz
-    
+
     sigma_yz_main = np.zeros((Nz, Ny, Nx))
     sigma_yz_main[1:, 1:, :] = sigma_yz
-    
+
     # Use interpolated values for visualization
     v_x = v_x_main
     v_y = v_y_main
@@ -968,62 +997,79 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
     sigma_xy = sigma_xy_main
     sigma_xz = sigma_xz_main
     sigma_yz = sigma_yz_main
-    
+
     # Create grid coordinates
-    x = np.linspace(0, (Nx-1)*dx, Nx)
-    y = np.linspace(0, (Ny-1)*dy, Ny)
-    z = np.linspace(0, (Nz-1)*dz, Nz)
+    x = np.linspace(0, (Nx - 1) * dx, Nx)
+    y = np.linspace(0, (Ny - 1) * dy, Ny)
+    z = np.linspace(0, (Nz - 1) * dz, Nz)
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    
+
     # Subsample the grid for quiver plots
     X_sub = X[::subsample, ::subsample, ::subsample]
     Y_sub = Y[::subsample, ::subsample, ::subsample]
     Z_sub = Z[::subsample, ::subsample, ::subsample]
-    
+
     # Subsample velocity components
     v_x_sub = v_x[::subsample, ::subsample, ::subsample]
     v_y_sub = v_y[::subsample, ::subsample, ::subsample]
     v_z_sub = v_z[::subsample, ::subsample, ::subsample]
-    
+
     # Subsample stress components (using diagonal for visualization)
     sigma_xx_sub = sigma_xx[::subsample, ::subsample, ::subsample]
     sigma_yy_sub = sigma_yy[::subsample, ::subsample, ::subsample]
     sigma_zz_sub = sigma_zz[::subsample, ::subsample, ::subsample]
-    
+
+    # Arrow length in data coordinates: fraction of domain so arrows are always visible
+    extent = max((Nx - 1) * dx, (Ny - 1) * dy, (Nz - 1) * dz)
+    arrow_length = 0.15 * extent  # longest arrow = 15% of domain
+    if extent <= 0:
+        arrow_length = 0.1
+
     # Initialize 3D plot
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
-    
+
     # Plot Velocity Field Vectors
     if show_velocity:
-        ax.quiver(X_sub, Y_sub, Z_sub,
-                  v_x_sub, v_y_sub, v_z_sub,
-                  color='r', length=scale_v,
-                  linewidth=width_v, arrow_length_ratio=0.3,
-                  label='Velocity Field', alpha=0.7)
-    
+        v_mag_sub = np.sqrt(v_x_sub ** 2 + v_y_sub ** 2 + v_z_sub ** 2)
+        v_max_sub = np.max(v_mag_sub)
+
+        if v_max_sub > 0:
+            # Normalize so direction is visible; use fixed arrow length for visibility
+            ax.quiver(X_sub, Y_sub, Z_sub,
+                      v_x_sub, v_y_sub, v_z_sub,
+                      color='r', length=arrow_length,
+                      linewidth=width_v, arrow_length_ratio=0.25,
+                      label='Velocity Field', alpha=0.7, normalize=True)
+        else:
+            print("  Note: Velocity field is zero - not plotting velocity vectors")
+
     # Plot Stress Field (diagonal components as vectors)
     if show_stress:
-        ax.quiver(X_sub, Y_sub, Z_sub,
-                  sigma_xx_sub, sigma_yy_sub, sigma_zz_sub,
-                  color='b', length=scale_stress,
-                  linewidth=width_stress, arrow_length_ratio=0.3,
-                  label='Stress (diagonal)', alpha=0.5)
-    
+        s_mag = np.sqrt(sigma_xx_sub ** 2 + sigma_yy_sub ** 2 + sigma_zz_sub ** 2)
+        if np.max(s_mag) > 0:
+            ax.quiver(X_sub, Y_sub, Z_sub,
+                      sigma_xx_sub, sigma_yy_sub, sigma_zz_sub,
+                      color='b', length=arrow_length,
+                      linewidth=width_stress, arrow_length_ratio=0.25,
+                      label='Stress (diagonal)', alpha=0.5, normalize=True)
+        else:
+            print("  Note: Stress field is zero - not plotting stress vectors")
+
     # Set plot labels and title with larger fonts
     ax.set_xlabel('X [m]', fontsize=18)
     ax.set_ylabel('Y [m]', fontsize=18)
     ax.set_zlabel('Z [m]', fontsize=18)
     ax.set_title(title, fontsize=20, fontweight='bold', pad=20)
-    
+
     # Increase tick label sizes
     ax.tick_params(axis='x', labelsize=12)
     ax.tick_params(axis='y', labelsize=12)
     ax.tick_params(axis='z', labelsize=12)
-    
+
     # Add legend with larger font
     ax.legend(fontsize=16, loc='upper right')
-    
+
     # Save or show the plot
     plt.tight_layout()
     if save_file:
@@ -1033,36 +1079,211 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
     else:
         plt.show()
 
+
+def phi_to_fields_main_grid(phi, Nx, Ny, Nz):
+    """Extract velocity and stress from state vector and interpolate to main grid (Nz, Ny, Nx)."""
+    N_main = Nx * Ny * Nz
+    N_vx = (Nx - 1) * Ny * Nz
+    N_vy = Nx * (Ny - 1) * Nz
+    N_vz = Nx * Ny * (Nz - 1)
+    N_sxy = (Nx - 1) * (Ny - 1) * Nz
+    N_sxz = (Nx - 1) * Ny * (Nz - 1)
+    N_syz = Nx * (Ny - 1) * (Nz - 1)
+    idx = 0
+    v_x = phi[idx:idx + N_vx].reshape(Nz, Ny, Nx - 1)
+    idx += N_vx
+    v_y = phi[idx:idx + N_vy].reshape(Nz, Ny - 1, Nx)
+    idx += N_vy
+    v_z = phi[idx:idx + N_vz].reshape(Nz - 1, Ny, Nx)
+    idx += N_vz
+    sigma_xx = phi[idx:idx + N_main].reshape(Nz, Ny, Nx)
+    idx += N_main
+    sigma_yy = phi[idx:idx + N_main].reshape(Nz, Ny, Nx)
+    idx += N_main
+    sigma_zz = phi[idx:idx + N_main].reshape(Nz, Ny, Nx)
+    idx += N_main
+    sigma_xy = phi[idx:idx + N_sxy].reshape(Nz, Ny - 1, Nx - 1)
+    idx += N_sxy
+    sigma_xz = phi[idx:idx + N_sxz].reshape(Nz - 1, Ny, Nx - 1)
+    idx += N_sxz
+    sigma_yz = phi[idx:idx + N_syz].reshape(Nz - 1, Ny - 1, Nx)
+    # Interpolate velocity to main grid
+    v_x_main = np.zeros((Nz, Ny, Nx))
+    v_x_main[:, :, 0], v_x_main[:, :, -1] = v_x[:, :, 0], v_x[:, :, -1]
+    v_x_main[:, :, 1:-1] = 0.5 * (v_x[:, :, :-1] + v_x[:, :, 1:])
+    v_y_main = np.zeros((Nz, Ny, Nx))
+    v_y_main[:, 0, :], v_y_main[:, -1, :] = v_y[:, 0, :], v_y[:, -1, :]
+    v_y_main[:, 1:-1, :] = 0.5 * (v_y[:, :-1, :] + v_y[:, 1:, :])
+    v_z_main = np.zeros((Nz, Ny, Nx))
+    v_z_main[0, :, :], v_z_main[-1, :, :] = v_z[0, :, :], v_z[-1, :, :]
+    v_z_main[1:-1, :, :] = 0.5 * (v_z[:-1, :, :] + v_z[1:, :, :])
+    # Interpolate off-diagonal stress to main grid (nearest-neighbor)
+    sigma_xy_main = np.zeros((Nz, Ny, Nx))
+    sigma_xy_main[:, 1:, 1:] = sigma_xy
+    sigma_xy_main[:, 0, :] = sigma_xy_main[:, 1, :]
+    sigma_xy_main[:, :, 0] = sigma_xy_main[:, :, 1]
+    sigma_xz_main = np.zeros((Nz, Ny, Nx))
+    sigma_xz_main[1:, :, 1:] = sigma_xz
+    sigma_xz_main[0, :, :] = sigma_xz_main[1, :, :]
+    sigma_xz_main[:, :, 0] = sigma_xz_main[:, :, 1]
+    sigma_yz_main = np.zeros((Nz, Ny, Nx))
+    sigma_yz_main[1:, 1:, :] = sigma_yz
+    sigma_yz_main[0, :, :] = sigma_yz_main[1, :, :]
+    sigma_yz_main[:, 0, :] = sigma_yz_main[:, 1, :]
+    return (v_x_main, v_y_main, v_z_main,
+            sigma_xx, sigma_yy, sigma_zz,
+            sigma_xy_main, sigma_xz_main, sigma_yz_main)
+
+
+def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
+                                fracture1_z, fracture2_x,
+                                subsample=2, save_file=None):
+    """Interactive 3D plot: separate velocity and stress fields.
+    Left: velocity as quiver arrows colored by |v|. Right: stress as quiver colored by |σ·n|.
+    Both show fracture planes (transparent grey) and share a time-step slider.
+    """
+    import matplotlib
+    matplotlib.use('TkAgg' if save_file is None else 'Agg')
+    from matplotlib.widgets import Slider
+    # Centered grid (same as main.py)
+    x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
+    y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
+    z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    x_frac, z_frac = x[fracture2_x], z[fracture1_z]
+    # Precompute fields for each snapshot
+    data = []
+    for phi in snapshots:
+        vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(
+            np.real(phi), Nx, Ny, Nz)
+        v_mag = np.sqrt(vxm ** 2 + vym ** 2 + vzm ** 2)
+        r = np.sqrt(X ** 2 + Y ** 2 + Z ** 2)
+        r_safe = np.where(r > 1e-12, r, 1.0)
+        nx, ny, nz = X / r_safe, Y / r_safe, Z / r_safe
+        tx = sxx * nx + sxy * ny + sxz * nz
+        ty = sxy * nx + syy * ny + syz * nz
+        tz = sxz * nx + syz * ny + szz * nz
+        data.append((v_mag, tx, ty, tz, vxm, vym, vzm))
+    # Subsampled grid
+    X_sub = X[::subsample, ::subsample, ::subsample]
+    Y_sub = Y[::subsample, ::subsample, ::subsample]
+    Z_sub = Z[::subsample, ::subsample, ::subsample]
+    extent = max((Nx - 1) * dx, (Ny - 1) * dy, (Nz - 1) * dz)
+    arrow_len = 0.12 * extent
+    fig = plt.figure(figsize=(16, 7))
+    ax_vel = fig.add_axes([0.02, 0.25, 0.42, 0.7], projection='3d')
+    cax_vel = fig.add_axes([0.44, 0.4, 0.015, 0.4])
+    ax_stress = fig.add_axes([0.5, 0.25, 0.42, 0.7], projection='3d')
+    cax_stress = fig.add_axes([0.92, 0.4, 0.015, 0.4])
+    slider_ax = fig.add_axes([0.2, 0.08, 0.6, 0.04])
+    step_slider = Slider(slider_ax, 'Time step', 0, len(snapshots) - 1, valinit=0, valstep=1)
+    idx_max = len(snapshots) - 1
+    view_state = [None, None]  # (elev, azim) for each axis
+
+    def add_fracture_planes(ax):
+        x_edges = [x[0], x[-1]]
+        y_edges = [y[0], y[-1]]
+        XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+        ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac), alpha=0.35, color='grey')
+        YY_v, ZZ_v = np.meshgrid(y_edges, [z[0], z[-1]])
+        ax.plot_surface(np.full_like(YY_v, x_frac), YY_v, ZZ_v, alpha=0.35, color='grey')
+
+    def draw(step_idx):
+        step_idx = int(np.clip(step_idx, 0, idx_max))
+        v_mag, tx, ty, tz, vxm, vym, vzm = data[step_idx]
+        v_mag_sub = v_mag[::subsample, ::subsample, ::subsample]
+        tx_sub = tx[::subsample, ::subsample, ::subsample]
+        ty_sub = ty[::subsample, ::subsample, ::subsample]
+        tz_sub = tz[::subsample, ::subsample, ::subsample]
+        vxm_sub = vxm[::subsample, ::subsample, ::subsample]
+        vym_sub = vym[::subsample, ::subsample, ::subsample]
+        vzm_sub = vzm[::subsample, ::subsample, ::subsample]
+        t_mag_sub = np.sqrt(tx_sub ** 2 + ty_sub ** 2 + tz_sub ** 2)
+        v_flat = v_mag_sub.flatten()
+        t_flat = t_mag_sub.flatten()
+        v_max, t_max = np.max(v_flat) + 1e-20, np.max(t_flat) + 1e-20
+        # Normalize for arrow direction; color = magnitude
+        v_flat_n = v_flat / v_max
+        t_flat_n = t_flat / t_max
+        # --- Velocity (left): quiver + color bar ---
+        ax_vel.clear()
+        add_fracture_planes(ax_vel)
+        if np.max(v_mag_sub) > 1e-20:
+            qv = ax_vel.quiver(X_sub, Y_sub, Z_sub, vxm_sub, vym_sub, vzm_sub,
+                               length=arrow_len, normalize=True, alpha=0.8,
+                               cmap='Reds', linewidth=1.5)
+            qv.set_array(v_flat)
+            cax_vel.clear()
+            fig.colorbar(qv, cax=cax_vel, label='|v|')
+        ax_vel.set_xlabel('x [m]')
+        ax_vel.set_ylabel('y [m]')
+        ax_vel.set_zlabel('z [m]')
+        ax_vel.set_title(f'Velocity  t = {times[step_idx]:.2e} s')
+        ax_vel.set_box_aspect([1, 1, 1])
+        # --- Stress·n (right): quiver + color bar ---
+        ax_stress.clear()
+        add_fracture_planes(ax_stress)
+        if np.max(t_mag_sub) > 1e-20:
+            qt = ax_stress.quiver(X_sub, Y_sub, Z_sub, tx_sub, ty_sub, tz_sub,
+                                  length=arrow_len, normalize=True, alpha=0.8,
+                                  cmap='Blues', linewidth=1.5)
+            qt.set_array(t_flat)
+            cax_stress.clear()
+            fig.colorbar(qt, cax=cax_stress, label='|σ·n|')
+        ax_stress.set_xlabel('x [m]')
+        ax_stress.set_ylabel('y [m]')
+        ax_stress.set_zlabel('z [m]')
+        ax_stress.set_title(f'Stress·n  t = {times[step_idx]:.2e} s')
+        ax_stress.set_box_aspect([1, 1, 1])
+        # Restore view
+        if view_state[0] is not None:
+            ax_vel.view_init(elev=view_state[0][0], azim=view_state[0][1])
+        if view_state[1] is not None:
+            ax_stress.view_init(elev=view_state[1][0], azim=view_state[1][1])
+        view_state[0] = (ax_vel.elev, ax_vel.azim)
+        view_state[1] = (ax_stress.elev, ax_stress.azim)
+        fig.canvas.draw_idle()
+
+    step_slider.on_changed(draw)
+    draw(0)
+    plt.tight_layout(rect=[0, 0, 1, 0.22])
+    if save_file:
+        plt.savefig(save_file, dpi=150, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
 def plot_maxwells_3D(phi, Nx, Ny, Nz, dx, dy, dz,
-                      title='3D Wave Field',
-                      subsample=4, scale_E=1.5, scale_B=1.5,
-                      width_E=2, width_B=2
-                      ):
+                     title='3D Wave Field',
+                     subsample=4, scale_E=1.5, scale_B=1.5,
+                     width_E=2, width_B=2
+                     ):
     """Plot electric and magnetic fields as quiver plots in 3D."""
 
     # Calculate total number of points
-    N_total = Nx * Ny * Nz 
-    
+    N_total = Nx * Ny * Nz
+
     # Split phi into phi_E and phi_B
-    phi_E = phi[:3*N_total]
-    phi_B = phi[3*N_total:]
+    phi_E = phi[:3 * N_total]
+    phi_B = phi[3 * N_total:]
 
     # Split phi_E into Ex, Ey, Ez
     Ex = phi_E[:N_total].reshape(Nz, Ny, Nx)
-    Ey = phi_E[N_total:2*N_total].reshape(Nz, Ny, Nx)
-    Ez = phi_E[2*N_total:3*N_total].reshape(Nz, Ny, Nx)
+    Ey = phi_E[N_total:2 * N_total].reshape(Nz, Ny, Nx)
+    Ez = phi_E[2 * N_total:3 * N_total].reshape(Nz, Ny, Nx)
 
     # Split phi_B into Bx, By, Bz
-    Bx = phi_B[:(N_total-Ny*Nz)].reshape(Ny, Nz, (Nx-1))
-    By = phi_B[(N_total-Ny*Nz):(2*N_total-Ny*Nz-Nx*Nz)].reshape(Nz, (Ny-1), Nx)
-    Bz = phi_B[(2*N_total-Ny*Nz-Nx*Nz):].reshape((Nz-1), Ny, Nx)
+    Bx = phi_B[:(N_total - Ny * Nz)].reshape(Ny, Nz, (Nx - 1))
+    By = phi_B[(N_total - Ny * Nz):(2 * N_total - Ny * Nz - Nx * Nz)].reshape(Nz, (Ny - 1), Nx)
+    Bz = phi_B[(2 * N_total - Ny * Nz - Nx * Nz):].reshape((Nz - 1), Ny, Nx)
 
     # Create grid coordinates
-    x = np.linspace(0, (Nx-1)*dx, Nx)
-    y = np.linspace(0, (Ny-1)*dy, Ny)
-    z = np.linspace(0, (Nz-1)*dz, Nz)
+    x = np.linspace(0, (Nx - 1) * dx, Nx)
+    y = np.linspace(0, (Ny - 1) * dy, Ny)
+    z = np.linspace(0, (Nz - 1) * dz, Nz)
     X, Y, Z = np.meshgrid(x, y, z)
-    
+
     # Subsample the grid for quiver plots
     X_sub = X[::subsample, ::subsample, ::subsample]
     Y_sub = Y[::subsample, ::subsample, ::subsample]
@@ -1098,7 +1319,7 @@ def plot_maxwells_3D(phi, Nx, Ny, Nz, dx, dy, dz,
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     ax.set_title(title)
-    
+
     # Correct origin to upper
     ax.invert_zaxis()
 
@@ -1108,6 +1329,7 @@ def plot_maxwells_3D(phi, Nx, Ny, Nz, dx, dy, dz,
     # Show the plot
     plt.show()
 
+
 def plot_field_3D(state):
     """Plot vector field on spherical grid"""
     # Extract dimensions
@@ -1115,7 +1337,7 @@ def plot_field_3D(state):
 
     # Generate spherical coordinates
     theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)  # Azimuthal angle
-    phi = np.linspace(-np.pi/2, np.pi/2, n_phi)  # Polar angle
+    phi = np.linspace(-np.pi / 2, np.pi / 2, n_phi)  # Polar angle
     radii = np.linspace(0, 1, n_radii)  # Radii from the center outward
 
     # Create a meshgrid for the spherical coordinates
@@ -1153,7 +1375,7 @@ def plot_field_3D(state):
             sizeref=0.05,  # Adjust sizeref for arrow size
             anchor="tail",
             showlegend=False,  # Disable legend for this trace
-            showscale=False     # Disable colorbar
+            showscale=False  # Disable colorbar
         )
     )
 
@@ -1164,15 +1386,15 @@ def plot_field_3D(state):
             yaxis_title='Y-coordinate',
             zaxis_title='Z-coordinate',
             aspectratio=dict(x=1, y=1, z=1),
-            xaxis = dict(nticks=4, range=[-1,1],),
-            yaxis = dict(nticks=4, range=[-1,1],),
-            zaxis = dict(nticks=4, range=[-1,1],),
+            xaxis=dict(nticks=4, range=[-1, 1], ),
+            yaxis=dict(nticks=4, range=[-1, 1], ),
+            zaxis=dict(nticks=4, range=[-1, 1], ),
         ),
         margin=dict(r=0, l=0, b=0, t=0),
         scene_camera=dict(
-        up=dict(x=0, y=0, z=1),
-        center=dict(x=0, y=0, z=-0.12),
-        eye=dict(x=1.5, y=1.5, z=1.5)
+            up=dict(x=0, y=0, z=1),
+            center=dict(x=0, y=0, z=-0.12),
+            eye=dict(x=1.5, y=1.5, z=1.5)
         ),
         font=dict(size=22),
         width=800,
@@ -1180,6 +1402,8 @@ def plot_field_3D(state):
     )
 
     return fig
+
+
 
 def subspaceProjector(staggered_grid_size, subspace_points=None):
     '''
