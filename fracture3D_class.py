@@ -6,78 +6,72 @@ class Fracture3D:
 
     Attributes:
         grid_dim (tuple): (Nx, Ny, Nz) numbers of grid points for each axis
-        cube_length (tuple): (dx, dy, dz) lengths of one cube for each axis
+        unit_dim (tuple): (dx, dy, dz) lengths of unit volume for each axis
         fracture (dict): dictionary containing information of each subvolume
     """
 
-    def __init__(self, grid_dim, cube_length):
+    def __init__(self, grid_dim, unit_dim):
         # Verify the valid attributes
         assert isinstance(grid_dim, tuple) == True
         assert len(grid_dim) == 3
-        assert isinstance(cube_length, tuple) == True
-        assert len(cube_length) == 3
+        assert isinstance(unit_dim, tuple) == True
+        assert len(unit_dim) == 3
         for i in range(len(grid_dim)):
             assert isinstance(grid_dim[i], int) == True
             assert grid_dim[i] >= 2
-            assert isinstance(cube_length[i], float) == True
-        
+            assert isinstance(unit_dim[i], float) == True
+
         self.__grid_dim = grid_dim
-        self.__cube_length = cube_length
+        self.__unit_dim = unit_dim
 
-        self.__staggered_grid_points = []
-        self.__main_grid_points = []
-        self.__cubes = {}
-
-        # Intialize two lists of points for the fracture object: staggered grid and main grid
+        # Intialize two dictionaries of points for the fracture object: staggered grid and main grid
         # Each main grid point consists of position, associated physical properties, and the wavefield vector of 9 components
         # Each staggered grid point consists of position and the component of velocity or stress
-        staggered_x = 2*grid_dim[0] - 1
-        staggered_y = 2*grid_dim[1] - 1
-        staggered_z = 2*grid_dim[2] - 1
-        for z in range(staggered_z+1):
-            for y in range(staggered_y+1):
-                for x in range(staggered_x+1):
-                    if x % 2 == 0 and y % 2 == 0 and z % 2 == 0:
-                        self.__main_grid_points.append(MainGridPoint((x//2, y//2, z//2)))
+        # Each key is a tuple of half-integer indices. Each value is a point object with the corresponding physical position.
+        self.__staggered_grid_points = {}
+        self.__main_grid_points = {}
+        # Also, store staggered grid points separately for each component of velocity and stress for easy access
+        for z in range(grid_dim[2]):
+            for y in range(grid_dim[1]):
+                for x in range(grid_dim[0]):
 
-        
-        # Initialize the fracture dictionary with subvolume information
-        # Each subvolume has the key (a,b,c) denoting ath cube along x-axis, bth along y-axis, and cth along z-axis.
-        for z in range(grid_dim[2]-1):
-            for y in range(grid_dim[1]-1):
-                for x in range(grid_dim[0]-1):
-                    self.__cubes[(x, y, z)] = {
-                        'center': ((x+0.5)*cube_length[0],
-                                   (y+0.5)*cube_length[1],
-                                   (z+0.5)*cube_length[2]),
-                        'main_grid_covered': [MainGridPoint(x, y, z),
-                                              MainGridPoint(x+cube_length[0], y, z),
-                                              MainGridPoint(x, y+cube_length[1], z),
-                                              MainGridPoint(x, y, z+cube_length[2]),
-                                              MainGridPoint(x+cube_length[0], y+cube_length[1], z),
-                                              MainGridPoint(x+cube_length[0], y, z+cube_length[2]),
-                                              MainGridPoint(x, y+cube_length[1], z+cube_length[2]),
-                                              MainGridPoint(x+cube_length[0], y+cube_length[1], z+cube_length[2])],
-                        'staggered_grid_covered': [StaggeredGridPoint(x+0.5, y, z, 'v_x'),
-                                                   StaggeredGridPoint(x, y+0.5, z, 'v_y]
-                    }
+                    # Add staggered grid points
+                    if x+0.5 <= grid_dim[0]-1:
+                        self.__staggered_grid_points[(x+0.5, y, z)] = StaggeredGridPoint(((x+0.5)*unit_dim[0], y*unit_dim[1], z*unit_dim[2]), 'v_x')
+                    if y+0.5 <= grid_dim[1]-1:
+                        self.__staggered_grid_points[(x, y+0.5, z)] = StaggeredGridPoint((x*unit_dim[0], (y+0.5)*unit_dim[1], z*unit_dim[2]), 'v_y')
+                    if z+0.5 <= grid_dim[2]-1:
+                        self.__staggered_grid_points[(x, y, z+0.5)] = StaggeredGridPoint((x*unit_dim[0], y*unit_dim[1], (z+0.5)*unit_dim[2]), 'v_z')
+                    self.__staggered_grid_points[(x, y, z)] = StaggeredGridPoint((x*unit_dim[0], y*unit_dim[1], z*unit_dim[2]), 's_xx')
+                    self.__staggered_grid_points[(x, y, z)] = StaggeredGridPoint((x*unit_dim[0], y*unit_dim[1], z*unit_dim[2]), 's_yy')
+                    self.__staggered_grid_points[(x, y, z)] = StaggeredGridPoint((x*unit_dim[0], y*unit_dim[1], z*unit_dim[2]), 's_zz')
+                    if x+0.5 <= grid_dim[0]-1 and y+0.5 <= grid_dim[1]-1:
+                        self.__staggered_grid_points[(x+0.5, y+0.5, z)] = StaggeredGridPoint(((x+0.5)*unit_dim[0], (y+0.5)*unit_dim[1], z*unit_dim[2]), 's_xy')
+                    if x+0.5 <= grid_dim[0]-1 and z+0.5 <= grid_dim[2]-1:
+                        self.__staggered_grid_points[(x+0.5, y, z+0.5)] = StaggeredGridPoint(((x+0.5)*unit_dim[0], y*unit_dim[1], (z+0.5)*unit_dim[2]), 's_xz')
+                    if y+0.5 <= grid_dim[1]-1 and z+0.5 <= grid_dim[2]-1:
+                        self.__staggered_grid_points[(x, y+0.5, z+0.5)] = StaggeredGridPoint((x*unit_dim[0], (y+0.5)*unit_dim[1], (z+0.5)*unit_dim[2]), 's_yz')
 
-        
+                    # Add main grid point
+                    self.__main_grid_points[(x, y, z)] = MainGridPoint((x*unit_dim[0], y*unit_dim[1], z*unit_dim[2]))
+                    #self.__main_grid_points[(x, y, z)] = MainGridPoint((x*unit_dim[0], y*unit_dim[1], z*unit_dim[2]))
+
     @property
     def gid_dim(self):
         return self.__grid_dim
-        
+
     @property
-    def cube_length(self):
-        return self.__cube_length
-    
+    def unit_dim(self):
+        return self.__unit_dim
+
     def staggeredGridSize(self):
         '''
         Return the total number of staggered grid points for velocity and stress components in the fracture.
         '''
-        Nx = self.__vol_dim[0] + 1
-        Ny = self.__vol_dim[1] + 1
-        Nz = self.__vol_dim[2] + 1
+
+        Nx = self.__grid_dim[0]
+        Ny = self.__grid_dim[1]
+        Nz = self.__grid_dim[2]
         N_main = Nx * Ny * Nz
         N_vx = (Nx-1) * Ny * Nz
         N_vy = Nx * (Ny-1) * Nz
@@ -89,7 +83,7 @@ class Fracture3D:
         N_stress = 3*N_main + N_sxy + N_sxz + N_syz
         N_total = N_vel + N_stress
         return N_total
-    
+
     def translation(self, dist):
         '''
         Translate a fracture with given distances along each axis
@@ -101,7 +95,7 @@ class Fracture3D:
         assert len(dist) == 3
         for i in range(len(dist)):
             assert isinstance(dist[i], float) == True
-        
+
         pass
 
 class MainGridPoint:
@@ -122,20 +116,30 @@ class MainGridPoint:
 
         self.__position = position
         self.__properties = {}
-        self.__wavefield = np.zeros(9)
+        self.__wavefield = {
+            'v_x': None,
+            'v_y': None,
+            'v_z': None,
+            's_xx': None,
+            's_yy': None,
+            's_zz': None,
+            's_xy': None,
+            's_xz': None,
+            's_yz': None
+        }
 
     @property
     def position(self):
         return self.__position
-        
+
     @property
     def properties(self):
         return self.__properties
-        
+
     @property
     def wavefield(self):
         return self.__wavefield
-        
+
     def translation(self, dist):
         '''
         Translate a grid point with given distances along each axis
@@ -147,7 +151,7 @@ class MainGridPoint:
         assert len(dist) == 3
         for i in range(len(dist)):
             assert isinstance(dist[i], float) == True
-        
+
         self.__position
 
 class StaggeredGridPoint:
@@ -168,15 +172,42 @@ class StaggeredGridPoint:
 
         self.__position = position
         self.__component = component
+        self.__value = 0
 
     @property
     def position(self):
         return self.__position
-        
+
     @property
     def component(self):
         return self.__component
-        
+
+    @property
+    def value(self):
+        return self.__value
+
+    def associated_main_grid_point(self, dx, dy, dz):
+        '''
+        Return the position of the main grid point associated with the staggered grid point.
+        '''
+
+        position = self.__position
+        component = self.__component
+        if component in ['s_xx', 's_yy', 's_zz']:
+            return position
+        elif component == 'v_x':
+            return (position[0]-0.5*dx, position[1], position[2])
+        elif component == 'v_y':
+            return (position[0], position[1]-0.5*dy, position[2])
+        elif component == 'v_z':
+            return (position[0], position[1], position[2]-0.5*dz)
+        elif component == 's_xy':
+            return (position[0]-0.5*dx, position[1]-0.5*dy, position[2])
+        elif component == 's_xz':
+            return (position[0]-0.5*dx, position[1], position[2]-0.5*dz)
+        elif component == 's_yz':
+            return (position[0], position[1]-0.5*dy, position[2]-0.5*dz)
+
     def translation(self, dist):
         '''
         Translate a grid point with given distances along each axis
@@ -188,7 +219,7 @@ class StaggeredGridPoint:
         assert len(dist) == 3
         for i in range(len(dist)):
             assert isinstance(dist[i], float) == True
-        
+
         self.__position = tuple(pos + trans for pos, trans in zip(self.__position, dist))
 
         return self.__position
