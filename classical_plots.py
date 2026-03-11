@@ -1,25 +1,26 @@
 """
-Classical 3D elastic wave simulation and plotting driven by fracture.py.
+Classical 3D elastic wave simulation and plotting.
 Combines functionality of main.py, plots.ipynb, and run_elastic_interactive_plot.py.
-Supports fracture.py: material parameters and fracture geometry (number of planes, shape).
 
-To change fracture shape (e.g. pitchfork): in fracture.py set
-  FRACTURE_SHAPE = "cross"   # or "pitchfork"
+This version is driven by:
+- `_fractures.py` for material parameters and fracture geometry
+- `_initial_conditions.py` for initial wavefield (Gaussian / Ricker)
 
-Usage:
-  python plots_classical.py --mode static          # save final image only
-  python plots_classical.py --mode interactive     # slider + play/pause
-  python plots_classical.py --mode animation       # save GIF
-  python plots_classical.py --mode all             # image + interactive + GIF
-  python plots_classical.py --initial bottom       # Gaussian at z_min (like run_elastic_interactive_plot)
-  python plots_classical.py --plots-2d            # also 2D z-slice PNG + GIF + HTML widget (open in browser)
+Usage (examples):
+  python classical_plots.py --mode static            # save final 3D image only
+  python classical_plots.py --mode interactive       # 3D interactive slider (no GIF)
+  python classical_plots.py --mode animation         # 3D GIF
+  python classical_plots.py --mode all               # 3D image + interactive + GIF
+  python classical_plots.py --plots-2d               # also 2D z-slice PNG + GIF + HTML widget (open in browser)
+  python classical_plots.py --help                   # help
 """
 import os
 import argparse
 import numpy as np
 from scipy.sparse.linalg import expm_multiply
 
-import fracture
+import _fractures as fractures
+import _initial_conditions as initial_conditions
 from _utility import (
     FD_solver_3D_elastic,
     plot_elastic_3D,
@@ -33,13 +34,19 @@ from _utility import (
 # Run options
 # ---------------------------------------------------------------------------
 MODE = "interactive"  # "static" | "interactive" | "animation" | "all"
-INITIAL_CONDITION = "center"  # "center" = Gaussian at domain center; "bottom" = at z_bottom
+INITIAL_CONDITION = "gaussian"  # "gaussian" | "ricker" (from _initial_conditions.py)
 N_STEPS = 20
 N_SUBSTEPS_PER_STEP = 100
 OUTPUT_IMAGE = "elastic_3D_simulation.png"
 OUTPUT_GIF = "elastic_3D_animation.gif"
 SUBSAMPLE = 2
 MAKE_ANIMATION = True  # when MODE is "animation" or "all"
+
+# Default grid
+NX = 16
+NY = 16
+NZ = 16
+DX = DY = DZ = 0.05
 
 
 def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
@@ -54,7 +61,7 @@ def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
 
     k = int(np.clip(k, 0, Nz - 1))
 
-    vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = _phi_to_fields_main_grid(
+    vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(
         np.real(phi_real), Nx, Ny, Nz
     )
     vmag = np.sqrt(vxm**2 + vym**2 + vzm**2)
@@ -123,12 +130,12 @@ def animate_2d_fields_zslice(history, Nx, Ny, Nz, k, output_file="slice_2d.gif",
     k = int(np.clip(k, 0, Nz - 1))
     n_steps = len(history)
 
-    # Precompute frames + global maxima (per key) for consistent scaling.
+    # Precompute frames 
     keys = ["v_x", "v_y", "v_z", "v_mag", "sigma_xx", "sigma_yy", "sigma_zz", "sigma_xy", "sigma_xz", "sigma_yz"]
     global_max = {key: 0.0 for key in keys}
     frames = []
     for phi in history:
-        vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = _phi_to_fields_main_grid(np.real(phi), Nx, Ny, Nz)
+        vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(np.real(phi), Nx, Ny, Nz)
         vmag = np.sqrt(vxm**2 + vym**2 + vzm**2)
         frame = {
             "v_x": vxm[k, :, :],
@@ -202,7 +209,7 @@ def plot_2d_slice_html_widget(history, Nx, Ny, Nz, k, output_file="elastic_2D_sl
     global_max = {key: 0.0 for key in keys}
     frames = []
     for phi in history:
-        vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = _phi_to_fields_main_grid(np.real(phi), Nx, Ny, Nz)
+        vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(np.real(phi), Nx, Ny, Nz)
         vmag = np.sqrt(vxm**2 + vym**2 + vzm**2)
         frame = {
             "v_x": vxm[k, :, :], "v_y": vym[k, :, :], "v_z": vzm[k, :, :],
@@ -268,33 +275,6 @@ def _grid_sizes(Nx, Ny, Nz):
     return N_main, N_vx, N_vy, N_vz, N_vel, N_stress, N_total
 
 
-def build_initial_state(Nx, Ny, Nz, dx, dy, dz, N_vel, N_main, N_total, initial_condition="center"):
-    """Build phi_0: Gaussian stress (σ_xx = σ_yy = σ_zz) with peak at center or bottom."""
-    x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
-    y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
-    z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
-    X, Y, Z = np.meshgrid(x, y, z, indexing="ij")
-    sigma = 2.5 * dx
-    amplitude = 0.005
-    if initial_condition == "bottom":
-        z_bottom = z[0]
-        gaussian = amplitude * np.exp(
-            -(X**2 + Y**2 + (Z - z_bottom) ** 2) / (2 * sigma**2)
-        )
-    else:
-        gaussian = amplitude * np.exp(-(X**2 + Y**2 + Z**2) / (2 * sigma**2))
-    g_flat = np.ascontiguousarray(gaussian.transpose(2, 1, 0)).flatten()
-
-    phi_0 = np.zeros(N_total, dtype=complex)
-    idx = N_vel
-    phi_0[idx : idx + N_main] = g_flat
-    idx += N_main
-    phi_0[idx : idx + N_main] = g_flat
-    idx += N_main
-    phi_0[idx : idx + N_main] = g_flat
-    return phi_0
-
-
 def run_simulation(
     rho_model,
     S,
@@ -328,21 +308,31 @@ def run_simulation(
         print("Matrix A anti-Hermitian:" if err_a < 1e-10 else f"WARNING A: {err_a:.2e}")
         print("Hamiltonian H Hermitian:" if err_h < 1e-10 else f"WARNING H: {err_h:.2e}")
 
-    need_varying_S = fracture.ADD_FRACTURES
-    if need_varying_S:
-        c_p_fracture = np.sqrt((fracture.lambda_fracture + 2 * fracture.mu_fracture) / fracture.rho_fracture)
-        c_p_min = min(c_p_fracture, fracture.c_p_base)
-    else:
-        c_p_min = fracture.c_p_base
+    # CFL based on background and fracture P-wave speeds from _fractures
+    c_p_fracture = np.sqrt((fractures.lambda_fracture + 2 * fractures.mu_fracture) / fractures.rho_fracture)
+    c_p_min = min(c_p_fracture, fractures.c_p_base)
     dt_max = dx / c_p_min
-    safety = 0.01 if need_varying_S else 0.1
+    safety = 0.01
     dt = safety * dt_max
     dt_sub = dt / n_substeps_per_step
 
     if verbose:
         print(f"Time step: dt={dt:.2e} s, {n_steps} steps, dt_sub={dt_sub:.2e} s")
 
-    phi_0 = build_initial_state(Nx, Ny, Nz, dx, dy, dz, N_vel, N_main, N_total, initial_condition)
+    # Initial condition from _initial_conditions (symmetric domain around zero)
+    Lx, Ly, Lz = (Nx - 1) * dx, (Ny - 1) * dy, (Nz - 1) * dz
+    xmin, xmax = -Lx / 2, Lx / 2
+    ymin, ymax = -Ly / 2, Ly / 2
+    zmin, zmax = -Lz / 2, Lz / 2
+    if initial_condition == "ricker":
+        phi_0 = initial_conditions.ricker_IC(
+            Nx, Ny, Nz, dx, dy, dz, xmin, xmax, ymin, ymax, zmin, zmax
+        )
+    else:
+        phi_0 = initial_conditions.gaussian_IC(
+            Nx, Ny, Nz, dx, dy, dz, xmin, xmax, ymin, ymax, zmin, zmax
+        )
+    phi_0 = np.asarray(phi_0, dtype=complex)
     psi_0 = B_sqrt @ phi_0
     initial_norm = np.linalg.norm(psi_0)
     psi_current = psi_0.copy() / initial_norm
@@ -389,9 +379,9 @@ def main():
     )
     parser.add_argument(
         "--initial",
-        choices=["center", "bottom"],
+        choices=["gaussian", "ricker"],
         default=INITIAL_CONDITION,
-        help="Gaussian peak at domain center or at bottom (z_min)",
+        help="Initial condition type from _initial_conditions.py",
     )
     parser.add_argument("--steps", type=int, default=N_STEPS, help="Number of time steps")
     parser.add_argument("--substeps", type=int, default=N_SUBSTEPS_PER_STEP, help="Substeps per step")
@@ -402,6 +392,9 @@ def main():
     parser.add_argument("--slice-out", default="elastic_2D_slice.png", help="Output PNG for 2D slice grid")
     parser.add_argument("--slice-gif", default="elastic_2D_slice.gif", help="Output GIF for 2D slice animation (needs snapshots)")
     parser.add_argument("--slice-html", default="elastic_2D_slice.html", help="Output HTML widget for 2D slice (slider+play, like notebook); open in browser")
+    parser.add_argument("--fracture-geometry", choices=["horizontal", "vertical", "cross"],
+                        default="horizontal",
+                        help="Fracture geometry from _fractures: one_horizontal, one_vertical, two_perpendicular")
     parser.add_argument("--subsample", type=int, default=SUBSAMPLE, help="Subsample factor for 3D plots")
     parser.add_argument("--no-verbose", action="store_true", help="Reduce console output")
     args = parser.parse_args()
@@ -411,18 +404,36 @@ def main():
     n_substeps = args.substeps
     save_snapshots = args.mode in ("interactive", "animation", "all")
 
-    # Build model from fracture.py (material + geometry: cross, pitchfork, etc.)
-    rho_model, S, fracture_mask, fracture_planes = fracture.build_models(verbose=verbose)
-    Nx, Ny, Nz = fracture.Nx, fracture.Ny, fracture.Nz
-    dx, dy, dz = fracture.dx, fracture.dy, fracture.dz
+    # Grid and material / fracture model from _fractures
+    Nx, Ny, Nz = NX, NY, NZ
+    dx, dy, dz = DX, DY, DZ
+    if args.fracture_geometry == "vertical":
+        rho_model, S = fractures.one_vertical_fracture(Nx, Ny, Nz, dx, dy, dz)
+    elif args.fracture_geometry == "cross":
+        rho_model, S = fractures.two_perpendicular_fractures(Nx, Ny, Nz, dx, dy, dz)
+    else:
+        rho_model, S = fractures.one_horizontal_fracture(Nx, Ny, Nz, dx, dy, dz)
+
+    # Build fracture plane list for 3D plots (transparent grey planes matching _fractures geometry)
+    # Physical coords: same centered grid as in _utility (x = i*dx - (Nx-1)*dx/2, etc.)
+    x_phys = np.arange(Nx) * dx - (Nx - 1) * dx / 2
+    y_phys = np.arange(Ny) * dy - (Ny - 1) * dy / 2
+    z_phys = np.arange(Nz) * dz - (Nz - 1) * dz / 2
+    x_center = float(x_phys[Nx // 2])
+    z_center = float(z_phys[Nz // 2])
+    if args.fracture_geometry == "vertical":
+        fracture_planes = [("x", x_center)]
+    elif args.fracture_geometry == "cross":
+        fracture_planes = [("z", z_center), ("x", x_center)]
+    else:
+        fracture_planes = [("z", z_center)]  # horizontal
 
     N_main, N_vx, N_vy, N_vz, N_vel, N_stress, N_total = _grid_sizes(Nx, Ny, Nz)
-    need_varying = fracture.ADD_FRACTURES
-    c_p_min = (min(
-        np.sqrt((fracture.lambda_fracture + 2 * fracture.mu_fracture) / fracture.rho_fracture),
-        fracture.c_p_base,
-    ) if need_varying else fracture.c_p_base)
-    dt = (0.01 if need_varying else 0.1) * (dx / c_p_min)
+    c_p_min = min(
+        np.sqrt((fractures.lambda_fracture + 2 * fractures.mu_fracture) / fractures.rho_fracture),
+        fractures.c_p_base,
+    )
+    dt = 0.01 * (dx / c_p_min)
     t_final = n_steps * dt
 
     phi_real, (snapshots, times) = run_simulation(
@@ -441,7 +452,7 @@ def main():
         verbose=verbose,
     )
 
-    fracture1_z, fracture2_x = fracture.get_legacy_fracture_indices()
+    fracture1_z, fracture2_x = Nz // 2, Nx // 2
 
     # 2D slice plots (static PNG; optional GIF if we have snapshots)
     if args.plots_2d:
