@@ -485,6 +485,11 @@ def compute_B_elastic_3D(rho_model, S_matrix, Nx, Ny, Nz):
     B_sqrt = sp.block_diag([B_v_sqrt, B_sigma_sqrt], format='csr')
     B_inv_sqrt = sp.block_diag([B_v_inv_sqrt, B_sigma_inv_sqrt], format='csr')
     
+    # Ensure B_inv_sqrt is exactly symmetric (critical for H to be Hermitian)
+    # For diagonal matrices, this should already be true, but enforce it for numerical precision
+    B_inv_sqrt = 0.5 * (B_inv_sqrt + B_inv_sqrt.T)
+    B_inv_sqrt = B_inv_sqrt.tocsr()
+    
     # Compute B_inv
     B_inv = B_inv_sqrt @ B_inv_sqrt
     
@@ -536,7 +541,7 @@ def compute_A_elastic_3D(Nx, Ny, Nz, dx, dy, dz, bcs):
          [  0, ∂_y,   0, ∂_x,   0, ∂_z],
          [  0,   0, ∂_z,   0, ∂_x, ∂_y]]
     
-    A_elastic = [[0_3×3, D], [D^T, 0_6×6]]
+    A_elastic = [[0_3×3, D], [-D^T, 0_6×6]] (anti-Hermitian so H = i B^{-1/2} A B^{-1/2} is Hermitian)
     
     Args:
         Nx, Ny, Nz: Number of grid points in x, y, z directions
@@ -667,7 +672,7 @@ def compute_A_elastic_3D(Nx, Ny, Nz, dx, dy, dz, bcs):
         [-D.T, zero_stress]
     ], format='csr')
     
-    return A
+    return A.tocsr()
 
 def FD_solver_2D(Nx, Ny, dx, dy, c_model, rho_model, rho_stag_x, rho_stag_y, 
                  bcs={'L': 'DBC', 'R': 'DBC', 'T': 'DBC', 'B': 'DBC'}):
@@ -1137,14 +1142,19 @@ def phi_to_fields_main_grid(phi, Nx, Ny, Nz):
 
 def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                                 fracture1_z, fracture2_x,
-                                subsample=2, save_file=None):
-    """Interactive 3D plot: separate velocity and stress fields.
-    Left: velocity as quiver arrows colored by |v|. Right: stress as quiver colored by |σ·n|.
-    Both show fracture planes (transparent grey) and share a time-step slider.
+                                fracture_planes=None,
+                                subsample=2, save_file=None, playback_interval_ms=200):
+    """Interactive 3D plot: separate velocity and stress (traction) fields.
+    Left: velocity as quiver arrows colored by |v|. Right: traction as quiver colored by |t|.
+    Both show fracture planes (transparent grey), a time-step slider, and Play/Pause buttons.
+    fracture_planes: optional list of (axis, coord) e.g. [('z', z_val), ('x', x_val)] for multiple planes.
+    If None, uses fracture1_z and fracture2_x for one horizontal and one vertical plane.
     """
     import matplotlib
-    matplotlib.use('TkAgg' if save_file is None else 'Agg')
-    from matplotlib.widgets import Slider
+    if save_file is not None:
+        matplotlib.use('Agg')  # headless when saving to file
+    # else: keep default backend (e.g. macosx on macOS) for interactive window
+    from matplotlib.widgets import Slider, Button
     # Centered grid (same as main.py)
     x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
     y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
@@ -1156,8 +1166,8 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
     for phi in snapshots:
         vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(
             np.real(phi), Nx, Ny, Nz)
-        v_mag = np.sqrt(vxm ** 2 + vym ** 2 + vzm ** 2)
-        r = np.sqrt(X ** 2 + Y ** 2 + Z ** 2)
+        v_mag = np.sqrt(vxm**2 + vym**2 + vzm**2)
+        r = np.sqrt(X**2 + Y**2 + Z**2)
         r_safe = np.where(r > 1e-12, r, 1.0)
         nx, ny, nz = X / r_safe, Y / r_safe, Z / r_safe
         tx = sxx * nx + sxy * ny + sxz * nz
@@ -1175,22 +1185,49 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
     cax_vel = fig.add_axes([0.44, 0.4, 0.015, 0.4])
     ax_stress = fig.add_axes([0.5, 0.25, 0.42, 0.7], projection='3d')
     cax_stress = fig.add_axes([0.92, 0.4, 0.015, 0.4])
-    slider_ax = fig.add_axes([0.2, 0.08, 0.6, 0.04])
-    step_slider = Slider(slider_ax, 'Time step', 0, len(snapshots) - 1, valinit=0, valstep=1)
+    # Play / Pause buttons and timeline slider
+    btn_ax_play = fig.add_axes([0.02, 0.08, 0.06, 0.04])
+    btn_ax_pause = fig.add_axes([0.09, 0.08, 0.06, 0.04])
+    slider_ax = fig.add_axes([0.18, 0.08, 0.72, 0.04])
+    step_slider = Slider(slider_ax, '', 0, len(snapshots) - 1, valinit=0, valstep=1)
+    fig.text(0.54, 0.135, 'Time step', ha='center', va='bottom', fontsize=10)
     idx_max = len(snapshots) - 1
     view_state = [None, None]  # (elev, azim) for each axis
+    play_timer = [None]  # use list so nested functions can rebind
 
     def add_fracture_planes(ax):
         x_edges = [x[0], x[-1]]
         y_edges = [y[0], y[-1]]
-        XX_h, YY_h = np.meshgrid(x_edges, y_edges)
-        ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac), alpha=0.35, color='grey')
-        YY_v, ZZ_v = np.meshgrid(y_edges, [z[0], z[-1]])
-        ax.plot_surface(np.full_like(YY_v, x_frac), YY_v, ZZ_v, alpha=0.35, color='grey')
+        z_edges = [z[0], z[-1]]
+        if fracture_planes is not None:
+            for axis, coord in fracture_planes:
+                if axis == 'z':
+                    XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+                    ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, coord), alpha=0.35, color='grey')
+                elif axis == 'x':
+                    YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
+                    ax.plot_surface(np.full_like(YY_v, coord), YY_v, ZZ_v, alpha=0.35, color='grey')
+                elif axis == 'y':
+                    XX_v, ZZ_v = np.meshgrid(x_edges, z_edges)
+                    ax.plot_surface(XX_v, np.full_like(XX_v, coord), ZZ_v, alpha=0.35, color='grey')
+        else:
+            XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+            ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac), alpha=0.35, color='grey')
+            YY_v, ZZ_v = np.meshgrid(y_edges, [z[0], z[-1]])
+            ax.plot_surface(np.full_like(YY_v, x_frac), YY_v, ZZ_v, alpha=0.35, color='grey')
 
     def draw(step_idx):
         step_idx = int(np.clip(step_idx, 0, idx_max))
         v_mag, tx, ty, tz, vxm, vym, vzm = data[step_idx]
+        # Align to grid (Nx, Ny, Nz): fields from phi_to_fields_main_grid are (Nz, Ny, Nx)
+        # so transpose so that [i,j,k] = value at (x[i], y[j], z[k])
+        v_mag = np.transpose(v_mag, (2, 1, 0))
+        tx = np.transpose(tx, (2, 1, 0))
+        ty = np.transpose(ty, (2, 1, 0))
+        tz = np.transpose(tz, (2, 1, 0))
+        vxm = np.transpose(vxm, (2, 1, 0))
+        vym = np.transpose(vym, (2, 1, 0))
+        vzm = np.transpose(vzm, (2, 1, 0))
         v_mag_sub = v_mag[::subsample, ::subsample, ::subsample]
         tx_sub = tx[::subsample, ::subsample, ::subsample]
         ty_sub = ty[::subsample, ::subsample, ::subsample]
@@ -1198,13 +1235,10 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         vxm_sub = vxm[::subsample, ::subsample, ::subsample]
         vym_sub = vym[::subsample, ::subsample, ::subsample]
         vzm_sub = vzm[::subsample, ::subsample, ::subsample]
-        t_mag_sub = np.sqrt(tx_sub ** 2 + ty_sub ** 2 + tz_sub ** 2)
+        t_mag_sub = np.sqrt(tx_sub**2 + ty_sub**2 + tz_sub**2)
         v_flat = v_mag_sub.flatten()
         t_flat = t_mag_sub.flatten()
         v_max, t_max = np.max(v_flat) + 1e-20, np.max(t_flat) + 1e-20
-        # Normalize for arrow direction; color = magnitude
-        v_flat_n = v_flat / v_max
-        t_flat_n = t_flat / t_max
         # --- Velocity (left): quiver + color bar ---
         ax_vel.clear()
         add_fracture_planes(ax_vel)
@@ -1220,7 +1254,7 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_vel.set_zlabel('z [m]')
         ax_vel.set_title(f'Velocity  t = {times[step_idx]:.2e} s')
         ax_vel.set_box_aspect([1, 1, 1])
-        # --- Stress·n (right): quiver + color bar ---
+        # --- Stress · n (right): quiver + color bar ---
         ax_stress.clear()
         add_fracture_planes(ax_stress)
         if np.max(t_mag_sub) > 1e-20:
@@ -1244,7 +1278,34 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         view_state[1] = (ax_stress.elev, ax_stress.azim)
         fig.canvas.draw_idle()
 
+    def stop_playback():
+        if play_timer[0] is not None:
+            play_timer[0].stop()
+            play_timer[0] = None
+
+    def on_timer():
+        current = int(step_slider.val)
+        if current >= idx_max:
+            stop_playback()
+            return
+        step_slider.set_val(current + 1)
+
+    def on_play(event):
+        stop_playback()
+        if step_slider.val >= idx_max:
+            step_slider.set_val(0)
+        play_timer[0] = fig.canvas.new_timer(interval=playback_interval_ms)
+        play_timer[0].add_callback(on_timer)
+        play_timer[0].start()
+
+    def on_pause(event):
+        stop_playback()
+
     step_slider.on_changed(draw)
+    btn_play = Button(btn_ax_play, 'Play', color='0.9', hovercolor='0.95')
+    btn_play.on_clicked(on_play)
+    btn_pause = Button(btn_ax_pause, 'Pause', color='0.9', hovercolor='0.95')
+    btn_pause.on_clicked(on_pause)
     draw(0)
     plt.tight_layout(rect=[0, 0, 1, 0.22])
     if save_file:
@@ -1252,6 +1313,179 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         plt.close()
     else:
         plt.show()
+
+
+def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
+                       fracture1_z, fracture2_x,
+                       fracture_planes=None,
+                       subsample=2, output_file="elastic_3D_animation.gif",
+                       fps=10):
+    """Create a GIF animation of 3D velocity and traction fields over time.
+
+    This reuses the same visualization as plot_elastic_3D_interactive
+    (velocity on the left, traction σ·n on the right, with fracture planes),
+    but renders each frame and stitches them into a GIF using imageio.
+    fracture_planes: optional list of (axis, coord) for multiple planes; if None uses fracture1_z, fracture2_x.
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend for off-screen rendering
+    import imageio.v2 as imageio
+
+    # Centered grid (same as main.py)
+    x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
+    y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
+    z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    x_frac, z_frac = x[fracture2_x], z[fracture1_z]
+
+    # Precompute fields for each snapshot
+    data = []
+    v_global_max = 0.0
+    t_global_max = 0.0
+    for phi in snapshots:
+        vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(
+            np.real(phi), Nx, Ny, Nz)
+        v_mag = np.sqrt(vxm**2 + vym**2 + vzm**2)
+        r = np.sqrt(X**2 + Y**2 + Z**2)
+        r_safe = np.where(r > 1e-12, r, 1.0)
+        nx, ny, nz = X / r_safe, Y / r_safe, Z / r_safe
+        tx = sxx * nx + sxy * ny + sxz * nz
+        ty = sxy * nx + syy * ny + syz * nz
+        tz = sxz * nx + syz * ny + szz * nz
+
+        # Track global maxima for consistent color scaling
+        v_global_max = max(v_global_max, np.max(v_mag))
+        t_global_max = max(
+            t_global_max,
+            np.max(np.sqrt(tx**2 + ty**2 + tz**2))
+        )
+        data.append((v_mag, tx, ty, tz, vxm, vym, vzm))
+
+    # Subsampled grid
+    X_sub = X[::subsample, ::subsample, ::subsample]
+    Y_sub = Y[::subsample, ::subsample, ::subsample]
+    Z_sub = Z[::subsample, ::subsample, ::subsample]
+    extent = max((Nx - 1) * dx, (Ny - 1) * dy, (Nz - 1) * dz)
+    arrow_len = 0.12 * extent
+
+    fig = plt.figure(figsize=(16, 7))
+    ax_vel = fig.add_axes([0.02, 0.25, 0.42, 0.7], projection='3d')
+    cax_vel = fig.add_axes([0.44, 0.4, 0.015, 0.4])
+    ax_stress = fig.add_axes([0.5, 0.25, 0.42, 0.7], projection='3d')
+    cax_stress = fig.add_axes([0.92, 0.4, 0.015, 0.4])
+
+    def add_fracture_planes(ax):
+        x_edges = [x[0], x[-1]]
+        y_edges = [y[0], y[-1]]
+        z_edges = [z[0], z[-1]]
+        if fracture_planes is not None:
+            for axis, coord in fracture_planes:
+                if axis == 'z':
+                    XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+                    ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, coord), alpha=0.35, color='grey')
+                elif axis == 'x':
+                    YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
+                    ax.plot_surface(np.full_like(YY_v, coord), YY_v, ZZ_v, alpha=0.35, color='grey')
+                elif axis == 'y':
+                    XX_v, ZZ_v = np.meshgrid(x_edges, z_edges)
+                    ax.plot_surface(XX_v, np.full_like(XX_v, coord), ZZ_v, alpha=0.35, color='grey')
+        else:
+            XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+            ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac),
+                            alpha=0.35, color='grey')
+            YY_v, ZZ_v = np.meshgrid(y_edges, [z[0], z[-1]])
+            ax.plot_surface(np.full_like(YY_v, x_frac), YY_v, ZZ_v,
+                            alpha=0.35, color='grey')
+
+    def init():
+        ax_vel.clear()
+        ax_stress.clear()
+        add_fracture_planes(ax_vel)
+        add_fracture_planes(ax_stress)
+        ax_vel.set_xlabel('x [m]')
+        ax_vel.set_ylabel('y [m]')
+        ax_vel.set_zlabel('z [m]')
+        ax_vel.set_box_aspect([1, 1, 1])
+        ax_stress.set_xlabel('x [m]')
+        ax_stress.set_ylabel('y [m]')
+        ax_stress.set_zlabel('z [m]')
+        ax_stress.set_box_aspect([1, 1, 1])
+        return []
+
+    def update(frame_idx):
+        v_mag, tx, ty, tz, vxm, vym, vzm = data[frame_idx]
+        # Align to grid (Nx, Ny, Nz): fields from phi_to_fields_main_grid are (Nz, Ny, Nx)
+        v_mag = np.transpose(v_mag, (2, 1, 0))
+        tx = np.transpose(tx, (2, 1, 0))
+        ty = np.transpose(ty, (2, 1, 0))
+        tz = np.transpose(tz, (2, 1, 0))
+        vxm = np.transpose(vxm, (2, 1, 0))
+        vym = np.transpose(vym, (2, 1, 0))
+        vzm = np.transpose(vzm, (2, 1, 0))
+
+        v_mag_sub = v_mag[::subsample, ::subsample, ::subsample]
+        tx_sub = tx[::subsample, ::subsample, ::subsample]
+        ty_sub = ty[::subsample, ::subsample, ::subsample]
+        tz_sub = tz[::subsample, ::subsample, ::subsample]
+        vxm_sub = vxm[::subsample, ::subsample, ::subsample]
+        vym_sub = vym[::subsample, ::subsample, ::subsample]
+        vzm_sub = vzm[::subsample, ::subsample, ::subsample]
+
+        t_mag_sub = np.sqrt(tx_sub**2 + ty_sub**2 + tz_sub**2)
+        v_flat = v_mag_sub.flatten()
+        t_flat = t_mag_sub.flatten()
+
+        ax_vel.clear()
+        add_fracture_planes(ax_vel)
+        if np.max(v_mag_sub) > 1e-20:
+            qv = ax_vel.quiver(X_sub, Y_sub, Z_sub,
+                               vxm_sub, vym_sub, vzm_sub,
+                               length=arrow_len, normalize=True,
+                               alpha=0.8, cmap='Reds', linewidth=1.5)
+            qv.set_clim(0.0, v_global_max if v_global_max > 0 else np.max(v_flat))
+            qv.set_array(v_flat)
+            cax_vel.clear()
+            fig.colorbar(qv, cax=cax_vel, label='|v|')
+        ax_vel.set_xlabel('x [m]')
+        ax_vel.set_ylabel('y [m]')
+        ax_vel.set_zlabel('z [m]')
+        ax_vel.set_title(f'Velocity  t = {times[frame_idx]:.2e} s')
+        ax_vel.set_box_aspect([1, 1, 1])
+
+        ax_stress.clear()
+        add_fracture_planes(ax_stress)
+        if np.max(t_mag_sub) > 1e-20:
+            qt = ax_stress.quiver(X_sub, Y_sub, Z_sub,
+                                  tx_sub, ty_sub, tz_sub,
+                                  length=arrow_len, normalize=True,
+                                  alpha=0.8, cmap='Blues', linewidth=1.5)
+            qt.set_clim(0.0, t_global_max if t_global_max > 0 else np.max(t_flat))
+            qt.set_array(t_flat)
+            cax_stress.clear()
+            fig.colorbar(qt, cax=cax_stress, label='|stress·n|')
+        ax_stress.set_xlabel('x [m]')
+        ax_stress.set_ylabel('y [m]')
+        ax_stress.set_zlabel('z [m]')
+        ax_stress.set_title(f'Stress·n  t = {times[frame_idx]:.2e} s')
+        ax_stress.set_box_aspect([1, 1, 1])
+
+        return []
+
+    # Render each frame to an image and collect in memory
+    frames_img = []
+    init()
+    for frame_idx in range(len(snapshots)):
+        update(frame_idx)
+        fig.canvas.draw()
+        buf = np.asarray(fig.canvas.buffer_rgba()).copy()
+        frames_img.append(buf)
+
+    # Write GIF
+    imageio.mimsave(output_file, frames_img, fps=fps)
+    plt.close(fig)
+    print(f"Saved animation to {output_file}")
+
+
 
 
 def plot_maxwells_3D(phi, Nx, Ny, Nz, dx, dy, dz,
