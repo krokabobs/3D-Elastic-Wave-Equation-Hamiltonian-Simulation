@@ -38,6 +38,33 @@ lambda_base = rho_base * c_p_base ** 2 - 2 * mu_base
 
 
 
+def get_grid_parameters():
+
+    xmin,ymin,zmin = -4000,-4000,-4000
+    xmax,ymax,zmax = 4000,4000,4000
+    Nx, Ny, Nz = 9, 9, 9
+    dx, dy, dz = (xmax-xmin)/Nx, (ymax-ymin)/Ny, (zmax-zmin)/Nz
+
+    return xmin,ymin,zmin,xmax,ymax,zmax,Nx,Ny,Nz,dx,dy,dz
+
+def get_grid_size(Nx,Ny,Nz):
+
+    # Calculate staggered grid sizes for 3D elastic
+    N_main = Nx * Ny * Nz
+    N_vx = (Nx-1) * Ny * Nz
+    N_vy = Nx * (Ny-1) * Nz
+    N_vz = Nx * Ny * (Nz-1)
+    N_sxy = (Nx-1) * (Ny-1) * Nz
+    N_sxz = (Nx-1) * Ny * (Nz-1)
+    N_syz = Nx * (Ny-1) * (Nz-1)
+    N_vel = N_vx + N_vy + N_vz
+    N_stress = 3*N_main + N_sxy + N_sxz + N_syz
+    psi_len = N_vel + N_stress  # Total state vector size for 3D elastic
+
+    return N_main,N_vx,N_vy,N_vz,N_sxy,N_sxz,N_syz,N_vel,N_stress,psi_len
+
+
+    
 #Define function to check parameters
 def print_material_parameters():
 
