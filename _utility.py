@@ -1161,8 +1161,10 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
     z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
     x_frac, z_frac = x[fracture2_x], z[fracture1_z]
-    # Precompute fields for each snapshot
+    # Precompute fields for each snapshot and global max for fixed color scale
     data = []
+    v_global_max = 0.0
+    t_global_max = 0.0
     for phi in snapshots:
         vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(
             np.real(phi), Nx, Ny, Nz)
@@ -1173,6 +1175,8 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         tx = sxx * nx + sxy * ny + sxz * nz
         ty = sxy * nx + syy * ny + syz * nz
         tz = sxz * nx + syz * ny + szz * nz
+        v_global_max = max(v_global_max, np.max(v_mag))
+        t_global_max = max(t_global_max, np.max(np.sqrt(tx**2 + ty**2 + tz**2)))
         data.append((v_mag, tx, ty, tz, vxm, vym, vzm))
     # Subsampled grid
     X_sub = X[::subsample, ::subsample, ::subsample]
@@ -1200,16 +1204,43 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         y_edges = [y[0], y[-1]]
         z_edges = [z[0], z[-1]]
         if fracture_planes is not None:
-            for axis, coord in fracture_planes:
+            for entry in fracture_planes:
+                # Support both legacy 2-tuple (axis, coord) and extended
+                # tuples that include in-plane extents derived from rho_model.
+                axis = entry[0]
+                coord = entry[1]
                 if axis == 'z':
-                    XX_h, YY_h = np.meshgrid(x_edges, y_edges)
-                    ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, coord), alpha=0.35, color='grey')
+                    if len(entry) >= 6:
+                        x_min, x_max, y_min, y_max = entry[2:6]
+                        XX_h, YY_h = np.meshgrid(
+                            [x_min, x_max],
+                            [y_min, y_max],
+                        )
+                    else:
+                        XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+                    ax.plot_surface(
+                        XX_h, YY_h, np.full_like(XX_h, coord),
+                        alpha=0.35, color='grey',
+                    )
                 elif axis == 'x':
-                    YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
-                    ax.plot_surface(np.full_like(YY_v, coord), YY_v, ZZ_v, alpha=0.35, color='grey')
+                    if len(entry) >= 6:
+                        z_min, z_max, y_min, y_max = entry[2:6]
+                        YY_v, ZZ_v = np.meshgrid(
+                            [y_min, y_max],
+                            [z_min, z_max],
+                        )
+                    else:
+                        YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
+                    ax.plot_surface(
+                        np.full_like(YY_v, coord), YY_v, ZZ_v,
+                        alpha=0.35, color='grey',
+                    )
                 elif axis == 'y':
                     XX_v, ZZ_v = np.meshgrid(x_edges, z_edges)
-                    ax.plot_surface(XX_v, np.full_like(XX_v, coord), ZZ_v, alpha=0.35, color='grey')
+                    ax.plot_surface(
+                        XX_v, np.full_like(XX_v, coord), ZZ_v,
+                        alpha=0.35, color='grey',
+                    )
         else:
             XX_h, YY_h = np.meshgrid(x_edges, y_edges)
             ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac), alpha=0.35, color='grey')
@@ -1238,8 +1269,9 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         t_mag_sub = np.sqrt(tx_sub**2 + ty_sub**2 + tz_sub**2)
         v_flat = v_mag_sub.flatten()
         t_flat = t_mag_sub.flatten()
-        v_max, t_max = np.max(v_flat) + 1e-20, np.max(t_flat) + 1e-20
-        # --- Velocity (left): quiver + color bar ---
+        v_max = np.max(v_flat) + 1e-20
+        t_max = np.max(t_flat) + 1e-20
+        # --- Velocity (left): quiver + color bar, fixed color scale ---
         ax_vel.clear()
         add_fracture_planes(ax_vel)
         if np.max(v_mag_sub) > 1e-20:
@@ -1247,11 +1279,15 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                                length=arrow_len, normalize=True, alpha=0.8,
                                cmap='Reds', linewidth=1.5)
             qv.set_array(v_flat)
+            qv.set_clim(0.0, v_global_max if v_global_max > 0 else v_max)
             cax_vel.clear()
             fig.colorbar(qv, cax=cax_vel, label='|v|')
         ax_vel.set_xlabel('x [m]')
         ax_vel.set_ylabel('y [m]')
         ax_vel.set_zlabel('z [m]')
+        ax_vel.set_xlim(x[0], x[-1])
+        ax_vel.set_ylim(y[0], y[-1])
+        ax_vel.set_zlim(z[0], z[-1])
         ax_vel.set_title(f'Velocity  t = {times[step_idx]:.2e} s')
         ax_vel.set_box_aspect([1, 1, 1])
         # --- Stress · n (right): quiver + color bar ---
@@ -1262,11 +1298,15 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                                   length=arrow_len, normalize=True, alpha=0.8,
                                   cmap='Blues', linewidth=1.5)
             qt.set_array(t_flat)
+            qt.set_clim(0.0, t_global_max if t_global_max > 0 else t_max)
             cax_stress.clear()
             fig.colorbar(qt, cax=cax_stress, label='|σ·n|')
         ax_stress.set_xlabel('x [m]')
         ax_stress.set_ylabel('y [m]')
         ax_stress.set_zlabel('z [m]')
+        ax_stress.set_xlim(x[0], x[-1])
+        ax_stress.set_ylim(y[0], y[-1])
+        ax_stress.set_zlim(z[0], z[-1])
         ax_stress.set_title(f'Stress·n  t = {times[step_idx]:.2e} s')
         ax_stress.set_box_aspect([1, 1, 1])
         # Restore view
@@ -1379,12 +1419,22 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         y_edges = [y[0], y[-1]]
         z_edges = [z[0], z[-1]]
         if fracture_planes is not None:
-            for axis, coord in fracture_planes:
+            for entry in fracture_planes:
+                axis = entry[0]
+                coord = entry[1]
                 if axis == 'z':
-                    XX_h, YY_h = np.meshgrid(x_edges, y_edges)
+                    if len(entry) >= 6:
+                        x_min, x_max, y_min, y_max = entry[2:6]
+                        XX_h, YY_h = np.meshgrid([x_min, x_max], [y_min, y_max])
+                    else:
+                        XX_h, YY_h = np.meshgrid(x_edges, y_edges)
                     ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, coord), alpha=0.35, color='grey')
                 elif axis == 'x':
-                    YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
+                    if len(entry) >= 6:
+                        z_min, z_max, y_min, y_max = entry[2:6]
+                        YY_v, ZZ_v = np.meshgrid([y_min, y_max], [z_min, z_max])
+                    else:
+                        YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
                     ax.plot_surface(np.full_like(YY_v, coord), YY_v, ZZ_v, alpha=0.35, color='grey')
                 elif axis == 'y':
                     XX_v, ZZ_v = np.meshgrid(x_edges, z_edges)
@@ -1405,10 +1455,16 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_vel.set_xlabel('x [m]')
         ax_vel.set_ylabel('y [m]')
         ax_vel.set_zlabel('z [m]')
+        ax_vel.set_xlim(x[0], x[-1])
+        ax_vel.set_ylim(y[0], y[-1])
+        ax_vel.set_zlim(z[0], z[-1])
         ax_vel.set_box_aspect([1, 1, 1])
         ax_stress.set_xlabel('x [m]')
         ax_stress.set_ylabel('y [m]')
         ax_stress.set_zlabel('z [m]')
+        ax_stress.set_xlim(x[0], x[-1])
+        ax_stress.set_ylim(y[0], y[-1])
+        ax_stress.set_zlim(z[0], z[-1])
         ax_stress.set_box_aspect([1, 1, 1])
         return []
 
