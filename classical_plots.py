@@ -12,7 +12,7 @@ Usage (examples):
   python classical_plots.py --mode animation         # 3D GIF
   python classical_plots.py --mode all               # 3D image + interactive + GIF
   python classical_plots.py --plots-2d               # also 2D z-slice PNG + GIF + HTML widget (open in browser)
-  python classical_plots.py --help                   # help
+  python classical_plots.py --help                   # show all options
 """
 import os
 import argparse
@@ -41,12 +41,6 @@ OUTPUT_IMAGE = "elastic_3D_simulation.png"
 OUTPUT_GIF = "elastic_3D_animation.gif"
 SUBSAMPLE = 2
 MAKE_ANIMATION = True  # when MODE is "animation" or "all"
-
-# Default grid
-NX = 16
-NY = 16
-NZ = 16
-DX = DY = DZ = 0.05
 
 
 def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
@@ -261,20 +255,6 @@ def plot_2d_slice_html_widget(history, Nx, Ny, Nz, k, output_file="elastic_2D_sl
     return output_file
 
 
-def _grid_sizes(Nx, Ny, Nz):
-    N_main = Nx * Ny * Nz
-    N_vx = (Nx - 1) * Ny * Nz
-    N_vy = Nx * (Ny - 1) * Nz
-    N_vz = Nx * Ny * (Nz - 1)
-    N_sxy = (Nx - 1) * (Ny - 1) * Nz
-    N_sxz = (Nx - 1) * Ny * (Nz - 1)
-    N_syz = Nx * (Ny - 1) * (Nz - 1)
-    N_vel = N_vx + N_vy + N_vz
-    N_stress = 3 * N_main + N_sxy + N_sxz + N_syz
-    N_total = N_vel + N_stress
-    return N_main, N_vx, N_vy, N_vz, N_vel, N_stress, N_total
-
-
 def run_simulation(
     rho_model,
     S,
@@ -284,6 +264,12 @@ def run_simulation(
     dx,
     dy,
     dz,
+    xmin,
+    xmax,
+    ymin,
+    ymax,
+    zmin,
+    zmax,
     n_steps,
     n_substeps_per_step,
     initial_condition="center",
@@ -293,7 +279,9 @@ def run_simulation(
     """
     Run time evolution. Returns final state phi_evolved and optionally list of (snapshots, times).
     """
-    N_main, N_vx, N_vy, N_vz, N_vel, N_stress, N_total = _grid_sizes(Nx, Ny, Nz)
+    N_main, N_vx, N_vy, N_vz, N_sxy, N_sxz, N_syz, N_vel, N_stress, N_total = fractures.get_grid_size(
+        Nx, Ny, Nz
+    )
 
     bcs = {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"}
     H, A, B, B_sqrt, B_inv, B_inv_sqrt = FD_solver_3D_elastic(
@@ -319,11 +307,8 @@ def run_simulation(
     if verbose:
         print(f"Time step: dt={dt:.2e} s, {n_steps} steps, dt_sub={dt_sub:.2e} s")
 
-    # Initial condition from _initial_conditions (symmetric domain around zero)
-    Lx, Ly, Lz = (Nx - 1) * dx, (Ny - 1) * dy, (Nz - 1) * dz
-    xmin, xmax = -Lx / 2, Lx / 2
-    ymin, ymax = -Ly / 2, Ly / 2
-    zmin, zmax = -Lz / 2, Lz / 2
+    # Initial condition from _initial_conditions, using the same physical
+    # domain extents as `_fractures.get_grid_parameters()`.
     if initial_condition == "ricker":
         phi_0 = initial_conditions.ricker_IC(
             Nx, Ny, Nz, dx, dy, dz, xmin, xmax, ymin, ymax, zmin, zmax
@@ -405,8 +390,20 @@ def main():
     save_snapshots = args.mode in ("interactive", "animation", "all")
 
     # Grid and material / fracture model from _fractures
-    Nx, Ny, Nz = NX, NY, NZ
-    dx, dy, dz = DX, DY, DZ
+    (
+        xmin,
+        ymin,
+        zmin,
+        xmax,
+        ymax,
+        zmax,
+        Nx,
+        Ny,
+        Nz,
+        dx,
+        dy,
+        dz,
+    ) = fractures.get_grid_parameters()
     if args.fracture_geometry == "vertical":
         rho_model, S = fractures.one_vertical_fracture(Nx, Ny, Nz, dx, dy, dz)
     elif args.fracture_geometry == "cross":
@@ -414,21 +411,55 @@ def main():
     else:
         rho_model, S = fractures.one_horizontal_fracture(Nx, Ny, Nz, dx, dy, dz)
 
-    # Build fracture plane list for 3D plots (transparent grey planes matching _fractures geometry)
-    # Physical coords: same centered grid as in _utility (x = i*dx - (Nx-1)*dx/2, etc.)
-    x_phys = np.arange(Nx) * dx - (Nx - 1) * dx / 2
-    y_phys = np.arange(Ny) * dy - (Ny - 1) * dy / 2
-    z_phys = np.arange(Nz) * dz - (Nz - 1) * dz / 2
-    x_center = float(x_phys[Nx // 2])
-    z_center = float(z_phys[Nz // 2])
-    if args.fracture_geometry == "vertical":
-        fracture_planes = [("x", x_center)]
-    elif args.fracture_geometry == "cross":
-        fracture_planes = [("z", z_center), ("x", x_center)]
-    else:
-        fracture_planes = [("z", z_center)]  # horizontal
+    # Build fracture plane list for 3D plots from the density model (rho == rho_fracture).
+    # Use one plane per orientation: the z-slice and x-slice that contain the most fracture
+    # cells (so we get a single cross, not a grid of planes). Also compute the in-plane
+    # extents from the fracture mask so that the plotted planes match the physical
+    # fracture size (do not reach the domain edges).
+    fracture_planes = []
+    try:
+        rho_frac_val = float(fractures.rho_fracture)
+    except Exception:
+        rho_frac_val = None
+    if rho_frac_val is not None:
+        frac_mask = np.isclose(rho_model, rho_frac_val)
+        x_phys = np.arange(Nx) * dx - (Nx - 1) * dx / 2
+        y_phys = np.arange(Ny) * dy - (Ny - 1) * dy / 2
+        z_phys = np.arange(Nz) * dz - (Nz - 1) * dz / 2
+        # One z-plane: the z-index with the most fracture cells (main horizontal plane)
+        n_frac_per_z = np.sum(frac_mask, axis=(1, 2))
+        if args.fracture_geometry in ("horizontal", "cross") and np.any(n_frac_per_z > 0):
+            iz = int(np.argmax(n_frac_per_z))
+            # Limit plane in x,y to where fractures actually exist
+            mask_z = frac_mask[iz, :, :]  # (Ny, Nx)
+            ys_nonzero = np.where(np.any(mask_z, axis=1))[0]
+            xs_nonzero = np.where(np.any(mask_z, axis=0))[0]
+            if ys_nonzero.size > 0 and xs_nonzero.size > 0:
+                y_min, y_max = y_phys[ys_nonzero[0]], y_phys[ys_nonzero[-1]]
+                x_min, x_max = x_phys[xs_nonzero[0]], x_phys[xs_nonzero[-1]]
+                # Entry: (axis, coord, x_min, x_max, y_min, y_max)
+                fracture_planes.append(
+                    ("z", float(z_phys[iz]), float(x_min), float(x_max), float(y_min), float(y_max))
+                )
+        # One x-plane: the x-index with the most fracture cells (main vertical plane)
+        n_frac_per_x = np.sum(frac_mask, axis=(0, 1))
+        if args.fracture_geometry in ("vertical", "cross") and np.any(n_frac_per_x > 0):
+            ix = int(np.argmax(n_frac_per_x))
+            # Limit plane in y,z to where fractures actually exist
+            mask_x = frac_mask[:, :, ix]  # (Nz, Ny)
+            zs_nonzero = np.where(np.any(mask_x, axis=1))[0]
+            ys_nonzero = np.where(np.any(mask_x, axis=0))[0]
+            if zs_nonzero.size > 0 and ys_nonzero.size > 0:
+                z_min, z_max = z_phys[zs_nonzero[0]], z_phys[zs_nonzero[-1]]
+                y_min, y_max = y_phys[ys_nonzero[0]], y_phys[ys_nonzero[-1]]
+                # Entry: (axis, coord, z_min, z_max, y_min, y_max)
+                fracture_planes.append(
+                    ("x", float(x_phys[ix]), float(z_min), float(z_max), float(y_min), float(y_max))
+                )
 
-    N_main, N_vx, N_vy, N_vz, N_vel, N_stress, N_total = _grid_sizes(Nx, Ny, Nz)
+    N_main, N_vx, N_vy, N_vz, N_sxy, N_sxz, N_syz, N_vel, N_stress, N_total = fractures.get_grid_size(
+        Nx, Ny, Nz
+    )
     c_p_min = min(
         np.sqrt((fractures.lambda_fracture + 2 * fractures.mu_fracture) / fractures.rho_fracture),
         fractures.c_p_base,
@@ -445,6 +476,12 @@ def main():
         dx,
         dy,
         dz,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        zmin,
+        zmax,
         n_steps=n_steps,
         n_substeps_per_step=n_substeps,
         initial_condition=args.initial,
