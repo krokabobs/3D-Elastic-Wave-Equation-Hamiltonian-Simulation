@@ -22,7 +22,7 @@ def gaussian_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
     Z, Y, X = np.meshgrid(z, y, x, indexing='ij')
 
     sigma = 1.5 * dx
-    amplitude = -50
+    amplitude = -.5
 
     zmin = (Nz - 1) * dz / 2
 
