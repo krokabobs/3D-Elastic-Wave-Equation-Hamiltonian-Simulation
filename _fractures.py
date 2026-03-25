@@ -40,10 +40,10 @@ lambda_base = rho_base * c_p_base ** 2 - 2 * mu_base
 
 def get_grid_parameters():
 
-    xmin,ymin,zmin = -4000,-4000,-4000
-    xmax,ymax,zmax = 4000,4000,4000
-    Nx, Ny, Nz = 9, 9, 9
-    dx, dy, dz = (xmax-xmin)/Nx, (ymax-ymin)/Ny, (zmax-zmin)/Nz
+    xmin,ymin,zmin = 0,0,0
+    xmax,ymax,zmax = 10,10,10
+    Nx, Ny, Nz = 5, 5, 5
+    dx, dy, dz = (xmax-xmin)/(Nx-1), (ymax-ymin)/(Ny-1), (zmax-zmin)/(Nz-1)
 
     return xmin,ymin,zmin,xmax,ymax,zmax,Nx,Ny,Nz,dx,dy,dz
 
