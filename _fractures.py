@@ -40,8 +40,8 @@ lambda_base = rho_base * c_p_base ** 2 - 2 * mu_base
 
 def get_grid_parameters():
 
-    xmin,ymin,zmin = 0,0,0
-    xmax,ymax,zmax = 10,10,10
+    xmin,ymin,zmin = -1,-1,-1
+    xmax,ymax,zmax = 1,1,1
     Nx, Ny, Nz = 5, 5, 5
     dx, dy, dz = (xmax-xmin)/(Nx-1), (ymax-ymin)/(Ny-1), (zmax-zmin)/(Nz-1)
 
@@ -73,6 +73,12 @@ def print_material_parameters():
     print(f"  μ_fracture = {mu_fracture:.2e} Pa")
     print(f"  ρ_fracture = {rho_fracture:.1f} kg/m³")
     print(f"  Expected c_p = {np.sqrt((lambda_fracture + 2 * mu_fracture) / rho_fracture):.1f} m/s")
+
+def no_fractures(Nx,Ny,Nz,dx,dy,dz):
+    rho_model = np.full((Nz, Ny, Nx), rho_base)
+    S_base = create_compliance_matrix_from_velocities(c_p_base, c_s_base, rho_base)
+    return rho_model,S_base
+    
 
 def one_horizontal_fracture(Nx,Ny,Nz,dx,dy,dz,fracture_thickness=0):
 
