@@ -48,12 +48,14 @@ def ricker_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
 
 
     f0 = 2.0            # Central frequency of the Ricker wavelet
-    x0, y0, z0 = 0.0, 0.0, 0.0   # Wavelet center
-    x_vx = np.linspace(xmin+dx/2,xmax-dx/2,Nx)
+    x0, y0, z0 = 0, 0, 0   # Wavelet center
+    x_vx = np.linspace(xmin+dx/2,xmax-dx/2,Nx-1)
     y_vx = np.linspace(ymin,ymax,Ny)
     z_vx = np.linspace(zmin,zmax,Nz)
 
     X_vx, Y_vx, Z_vx = np.meshgrid(x_vx, y_vx, z_vx, indexing='ij')
+
+    #print(X_vx)
 
     # Initialize velocity components (all zeros initially)
     v0x = np.zeros((Nx-1, Ny, Nz))
@@ -71,8 +73,9 @@ def ricker_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
     # Add a Ricker wavelet source to v_x component similarly to the acoustic case
     # Ricker function takes (f, x, y, z, x0, y0, z0) and returns a scalar or array
     ricker_vx = Ricker(f0, X_vx, Y_vx, Z_vx, x0, y0, z0)
+    #print(ricker_vx)
     v0x = np.round(ricker_vx, 20)
-
+    #print(v0x.flatten())
     # Stack the initial conditions in the correct order:
     # [v_x, v_y, v_z, σ_xx, σ_yy, σ_zz, σ_xy, σ_xz, σ_yz]
     phi_0 = np.concatenate([
