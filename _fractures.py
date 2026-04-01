@@ -42,7 +42,7 @@ def get_grid_parameters():
 
     xmin,ymin,zmin = -1,-1,-1
     xmax,ymax,zmax = 1,1,1
-    Nx, Ny, Nz = 5, 5, 5
+    Nx, Ny, Nz = 6, 6, 6
     dx, dy, dz = (xmax-xmin)/(Nx-1), (ymax-ymin)/(Ny-1), (zmax-zmin)/(Nz-1)
 
     return xmin,ymin,zmin,xmax,ymax,zmax,Nx,Ny,Nz,dx,dy,dz
