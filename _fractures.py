@@ -91,7 +91,7 @@ def one_horizontal_fracture(Nx,Ny,Nz,dx,dy,dz,fracture_thickness=0):
     fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
 
     # One horizontal fracture plane
-    fracture1_z = Nz // 2  # Horizontal plane (constant z)
+    fracture1_z = (Nz-1) // 2  # Horizontal plane (constant z)
 
     #Don't let the fractures extend into the top or bottom fourth of the domain
 
@@ -161,7 +161,7 @@ def one_vertical_fracture(Nx,Ny,Nz,dx,dy,dz,fracture_thickness=0):
     fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
 
     # One vertical fracture plane
-    fracture1_x = Nx // 2  # Vertical plane (constant x)
+    fracture1_x = (Nx-1) // 2  # Vertical plane (constant x)
 
     #Don't let the fractures extend into the top or bottom fourth of the domain
 
@@ -178,7 +178,7 @@ def one_vertical_fracture(Nx,Ny,Nz,dx,dy,dz,fracture_thickness=0):
         for j in range(Ny):
             for k in range(Nx):
                 is_fracture = (abs(k - fracture1_x) <= fracture_thickness and j>=frac_low_ind_y and j<frac_high_ind_y
-                               and i>=frac_low_ind_z and k<frac_high_ind_z)
+                               and i>=frac_low_ind_z and i<frac_high_ind_z)
                 if is_fracture:
                     fracture_mask[i, j, k] = True
                     fracture_cells += 1
@@ -226,8 +226,8 @@ def two_perpendicular_fractures(Nx,Ny,Nz,dx,dy,dz,fracture_thickness=0):
     fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
 
     # One vertical fracture plane
-    fracture1_x = Nx // 2  # Vertical plane (constant x)
-    fracture2_z = Nz // 2  # Horizontal plane (constant z)
+    fracture1_x = (Nx-1) // 2  # Vertical plane (constant x)
+    fracture2_z = (Nz-1) // 2  # Horizontal plane (constant z)
     #Don't let the fractures extend into the top or bottom fourth of the domain
 
     frac_high_ind_x = 3*Nx//4
@@ -246,7 +246,7 @@ def two_perpendicular_fractures(Nx,Ny,Nz,dx,dy,dz,fracture_thickness=0):
         for j in range(Ny):
             for k in range(Nx):
                 is_fracture = ((abs(k - fracture1_x) <= fracture_thickness and j>=frac_low_ind_y and j<frac_high_ind_y
-                               and i>=frac_low_ind_z and k<frac_high_ind_z) or (abs(i - fracture2_z) <= fracture_thickness 
+                               and i>=frac_low_ind_z and i<frac_high_ind_z) or (abs(i - fracture2_z) <= fracture_thickness 
                                 and j>=frac_low_ind_y and j<frac_high_ind_y and k>=frac_low_ind_x and k<frac_high_ind_x))
                 if is_fracture:
                     fracture_mask[i, j, k] = True
