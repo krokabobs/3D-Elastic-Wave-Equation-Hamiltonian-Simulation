@@ -916,7 +916,8 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
                     subsample=4, scale_v=1.5, scale_stress=0.5,
                     width_v=2, width_stress=1,
                     show_velocity=True, show_stress=True,
-                    save_file=None):
+                    save_file=None,
+                    xmin=0.0, ymin=0.0, zmin=0.0):
     """Plot velocity and stress fields for the 3D elastic wave equation.
 
     State vector: [v_x, v_y, v_z, σ_xx, σ_yy, σ_zz, σ_xy, σ_xz, σ_yz]
@@ -1003,10 +1004,10 @@ def plot_elastic_3D(phi, Nx, Ny, Nz, dx, dy, dz,
     sigma_xz = sigma_xz_main
     sigma_yz = sigma_yz_main
 
-    # Create grid coordinates
-    x = np.linspace(0, (Nx - 1) * dx, Nx)
-    y = np.linspace(0, (Ny - 1) * dy, Ny)
-    z = np.linspace(0, (Nz - 1) * dz, Nz)
+    # Create grid coordinates (match _fractures box + IC linspace)
+    x = xmin + np.linspace(0, (Nx - 1) * dx, Nx)
+    y = ymin + np.linspace(0, (Ny - 1) * dy, Ny)
+    z = zmin + np.linspace(0, (Nz - 1) * dz, Nz)
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
 
     # Subsample the grid for quiver plots
@@ -1140,10 +1141,63 @@ def phi_to_fields_main_grid(phi, Nx, Ny, Nz):
             sigma_xy_main, sigma_xz_main, sigma_yz_main)
 
 
+def _pad_axis_extent(lo, hi, cell, min_span_cells=1.0):
+    """Avoid degenerate 3D surfaces when lo≈hi (invisible in plot_surface)."""
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    span = hi - lo
+    need = max(float(cell) * min_span_cells, 1e-15)
+    if span < need:
+        mid = 0.5 * (lo + hi)
+        half = 0.5 * need
+        lo, hi = mid - half, mid + half
+    return lo, hi
+
+
+def _add_fracture_quad_xy(ax, z0, x_lo, x_hi, y_lo, y_hi):
+    """Horizontal patch z=z0 with explicit (x,y) corners — avoids mplot3d plot_surface mesh bugs."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    quad = [
+        (x_lo, y_lo, z0),
+        (x_hi, y_lo, z0),
+        (x_hi, y_hi, z0),
+        (x_lo, y_hi, z0),
+    ]
+    coll = Poly3DCollection(
+        [quad, list(reversed(quad))],
+        facecolors=(0.55, 0.55, 0.55, 0.45),
+        edgecolors=(0.45, 0.45, 0.45, 0.5),
+        linewidths=0.25,
+    )
+    ax.add_collection3d(coll)
+
+
+def _add_fracture_quad_yz(ax, x0, y_lo, y_hi, z_lo, z_hi):
+    """Vertical patch x=x0 with explicit (y,z) corners."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    quad = [
+        (x0, y_lo, z_lo),
+        (x0, y_hi, z_lo),
+        (x0, y_hi, z_hi),
+        (x0, y_lo, z_hi),
+    ]
+    coll = Poly3DCollection(
+        [quad, list(reversed(quad))],
+        facecolors=(0.55, 0.55, 0.55, 0.45),
+        edgecolors=(0.45, 0.45, 0.45, 0.5),
+        linewidths=0.25,
+    )
+    ax.add_collection3d(coll)
+
+
 def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                                 fracture1_z, fracture2_x,
                                 fracture_planes=None,
-                                subsample=2, save_file=None, playback_interval_ms=200):
+                                subsample=2, save_file=None, playback_interval_ms=200,
+                                xmin=None, ymin=None, zmin=None):
     """Interactive 3D plot: separate velocity and stress (traction) fields.
     Left: velocity as quiver arrows colored by |v|. Right: traction as quiver colored by |t|.
     Both show fracture planes (transparent grey), a time-step slider, and Play/Pause buttons.
@@ -1155,10 +1209,14 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         matplotlib.use('Agg')  # headless when saving to file
     # else: keep default backend (e.g. macosx on macOS) for interactive window
     from matplotlib.widgets import Slider, Button
-    # Centered grid (same as main.py)
-    x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
-    y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
-    z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
+    if xmin is not None and ymin is not None and zmin is not None:
+        x = xmin + np.arange(Nx) * dx
+        y = ymin + np.arange(Ny) * dy
+        z = zmin + np.arange(Nz) * dz
+    else:
+        x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
+        y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
+        z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
     x_frac, z_frac = x[fracture2_x], z[fracture1_z]
     # Precompute fields for each snapshot and global max for fixed color scale
@@ -1212,40 +1270,30 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                 if axis == 'z':
                     if len(entry) >= 6:
                         x_min, x_max, y_min, y_max = entry[2:6]
-                        XX_h, YY_h = np.meshgrid(
-                            [x_min, x_max],
-                            [y_min, y_max],
-                        )
+                        x_min, x_max = _pad_axis_extent(x_min, x_max, dx)
+                        y_min, y_max = _pad_axis_extent(y_min, y_max, dy)
+                        _add_fracture_quad_xy(ax, coord, x_min, x_max, y_min, y_max)
                     else:
-                        XX_h, YY_h = np.meshgrid(x_edges, y_edges)
-                    ax.plot_surface(
-                        XX_h, YY_h, np.full_like(XX_h, coord),
-                        alpha=0.35, color='grey',
-                    )
+                        _add_fracture_quad_xy(ax, coord, x_edges[0], x_edges[1], y_edges[0], y_edges[1])
                 elif axis == 'x':
                     if len(entry) >= 6:
                         z_min, z_max, y_min, y_max = entry[2:6]
-                        YY_v, ZZ_v = np.meshgrid(
-                            [y_min, y_max],
-                            [z_min, z_max],
-                        )
+                        y_min, y_max = _pad_axis_extent(y_min, y_max, dy)
+                        z_min, z_max = _pad_axis_extent(z_min, z_max, dz)
+                        _add_fracture_quad_yz(ax, coord, y_min, y_max, z_min, z_max)
                     else:
-                        YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
-                    ax.plot_surface(
-                        np.full_like(YY_v, coord), YY_v, ZZ_v,
-                        alpha=0.35, color='grey',
-                    )
+                        _add_fracture_quad_yz(
+                            ax, coord, y_edges[0], y_edges[1], z_edges[0], z_edges[-1]
+                        )
                 elif axis == 'y':
                     XX_v, ZZ_v = np.meshgrid(x_edges, z_edges)
                     ax.plot_surface(
                         XX_v, np.full_like(XX_v, coord), ZZ_v,
-                        alpha=0.35, color='grey',
+                        alpha=0.35, color='grey', shade=False,
                     )
         else:
-            XX_h, YY_h = np.meshgrid(x_edges, y_edges)
-            ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac), alpha=0.35, color='grey')
-            YY_v, ZZ_v = np.meshgrid(y_edges, [z[0], z[-1]])
-            ax.plot_surface(np.full_like(YY_v, x_frac), YY_v, ZZ_v, alpha=0.35, color='grey')
+            _add_fracture_quad_xy(ax, z_frac, x_edges[0], x_edges[1], y_edges[0], y_edges[1])
+            _add_fracture_quad_yz(ax, x_frac, y_edges[0], y_edges[1], z_edges[0], z_edges[-1])
 
     def draw(step_idx):
         step_idx = int(np.clip(step_idx, 0, idx_max))
@@ -1290,6 +1338,17 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_vel.set_zlim(z[0], z[-1])
         ax_vel.set_title(f'Velocity  t = {times[step_idx]:.2e} s')
         ax_vel.set_box_aspect([1, 1, 1])
+        ax_vel.tick_params(colors='white')
+        for axis in (ax_vel.xaxis, ax_vel.yaxis, ax_vel.zaxis):
+            try:
+                axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0))
+                axis.pane.set_edgecolor((0.25, 0.25, 0.25, 1.0))
+            except Exception:
+                pass
+            try:
+                axis._axinfo["grid"]["color"] = (0.25, 0.25, 0.25, 1.0)
+            except Exception:
+                pass
         # --- Stress · n (right): quiver + color bar ---
         ax_stress.clear()
         add_fracture_planes(ax_stress)
@@ -1309,6 +1368,17 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_stress.set_zlim(z[0], z[-1])
         ax_stress.set_title(f'Stress·n  t = {times[step_idx]:.2e} s')
         ax_stress.set_box_aspect([1, 1, 1])
+        ax_stress.tick_params(colors='white')
+        for axis in (ax_stress.xaxis, ax_stress.yaxis, ax_stress.zaxis):
+            try:
+                axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0))
+                axis.pane.set_edgecolor((0.25, 0.25, 0.25, 1.0))
+            except Exception:
+                pass
+            try:
+                axis._axinfo["grid"]["color"] = (0.25, 0.25, 0.25, 1.0)
+            except Exception:
+                pass
         # Restore view
         if view_state[0] is not None:
             ax_vel.view_init(elev=view_state[0][0], azim=view_state[0][1])
@@ -1342,9 +1412,11 @@ def plot_elastic_3D_interactive(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         stop_playback()
 
     step_slider.on_changed(draw)
-    btn_play = Button(btn_ax_play, 'Play', color='0.9', hovercolor='0.95')
+    btn_play = Button(btn_ax_play, 'Play', color='black', hovercolor='0.2')
+    btn_play.label.set_color('white')
     btn_play.on_clicked(on_play)
-    btn_pause = Button(btn_ax_pause, 'Pause', color='0.9', hovercolor='0.95')
+    btn_pause = Button(btn_ax_pause, 'Pause', color='black', hovercolor='0.2')
+    btn_pause.label.set_color('white')
     btn_pause.on_clicked(on_pause)
     draw(0)
     plt.tight_layout(rect=[0, 0, 1, 0.22])
@@ -1359,7 +1431,8 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                        fracture1_z, fracture2_x,
                        fracture_planes=None,
                        subsample=2, output_file="elastic_3D_animation.gif",
-                       fps=10):
+                       fps=10,
+                       xmin=None, ymin=None, zmin=None):
     """Create a GIF animation of 3D velocity and traction fields over time.
 
     This reuses the same visualization as plot_elastic_3D_interactive
@@ -1371,10 +1444,14 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
     matplotlib.use('Agg')  # Non-interactive backend for off-screen rendering
     import imageio.v2 as imageio
 
-    # Centered grid (same as main.py)
-    x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
-    y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
-    z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
+    if xmin is not None and ymin is not None and zmin is not None:
+        x = xmin + np.arange(Nx) * dx
+        y = ymin + np.arange(Ny) * dy
+        z = zmin + np.arange(Nz) * dz
+    else:
+        x = np.arange(Nx) * dx - (Nx - 1) * dx / 2
+        y = np.arange(Ny) * dy - (Ny - 1) * dy / 2
+        z = np.arange(Nz) * dz - (Nz - 1) * dz / 2
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
     x_frac, z_frac = x[fracture2_x], z[fracture1_z]
 
@@ -1425,27 +1502,27 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
                 if axis == 'z':
                     if len(entry) >= 6:
                         x_min, x_max, y_min, y_max = entry[2:6]
-                        XX_h, YY_h = np.meshgrid([x_min, x_max], [y_min, y_max])
+                        x_min, x_max = _pad_axis_extent(x_min, x_max, dx)
+                        y_min, y_max = _pad_axis_extent(y_min, y_max, dy)
+                        _add_fracture_quad_xy(ax, coord, x_min, x_max, y_min, y_max)
                     else:
-                        XX_h, YY_h = np.meshgrid(x_edges, y_edges)
-                    ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, coord), alpha=0.35, color='grey')
+                        _add_fracture_quad_xy(ax, coord, x_edges[0], x_edges[1], y_edges[0], y_edges[1])
                 elif axis == 'x':
                     if len(entry) >= 6:
                         z_min, z_max, y_min, y_max = entry[2:6]
-                        YY_v, ZZ_v = np.meshgrid([y_min, y_max], [z_min, z_max])
+                        y_min, y_max = _pad_axis_extent(y_min, y_max, dy)
+                        z_min, z_max = _pad_axis_extent(z_min, z_max, dz)
+                        _add_fracture_quad_yz(ax, coord, y_min, y_max, z_min, z_max)
                     else:
-                        YY_v, ZZ_v = np.meshgrid(y_edges, z_edges)
-                    ax.plot_surface(np.full_like(YY_v, coord), YY_v, ZZ_v, alpha=0.35, color='grey')
+                        _add_fracture_quad_yz(
+                            ax, coord, y_edges[0], y_edges[1], z_edges[0], z_edges[-1]
+                        )
                 elif axis == 'y':
                     XX_v, ZZ_v = np.meshgrid(x_edges, z_edges)
-                    ax.plot_surface(XX_v, np.full_like(XX_v, coord), ZZ_v, alpha=0.35, color='grey')
+                    ax.plot_surface(XX_v, np.full_like(XX_v, coord), ZZ_v, alpha=0.35, color='grey', shade=False)
         else:
-            XX_h, YY_h = np.meshgrid(x_edges, y_edges)
-            ax.plot_surface(XX_h, YY_h, np.full_like(XX_h, z_frac),
-                            alpha=0.35, color='grey')
-            YY_v, ZZ_v = np.meshgrid(y_edges, [z[0], z[-1]])
-            ax.plot_surface(np.full_like(YY_v, x_frac), YY_v, ZZ_v,
-                            alpha=0.35, color='grey')
+            _add_fracture_quad_xy(ax, z_frac, x_edges[0], x_edges[1], y_edges[0], y_edges[1])
+            _add_fracture_quad_yz(ax, x_frac, y_edges[0], y_edges[1], z_edges[0], z_edges[-1])
 
     def init():
         ax_vel.clear()
@@ -1459,6 +1536,17 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_vel.set_ylim(y[0], y[-1])
         ax_vel.set_zlim(z[0], z[-1])
         ax_vel.set_box_aspect([1, 1, 1])
+        ax_vel.tick_params(colors='white')
+        for axis in (ax_vel.xaxis, ax_vel.yaxis, ax_vel.zaxis):
+            try:
+                axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0))
+                axis.pane.set_edgecolor((0.25, 0.25, 0.25, 1.0))
+            except Exception:
+                pass
+            try:
+                axis._axinfo["grid"]["color"] = (0.25, 0.25, 0.25, 1.0)
+            except Exception:
+                pass
         ax_stress.set_xlabel('x [m]')
         ax_stress.set_ylabel('y [m]')
         ax_stress.set_zlabel('z [m]')
@@ -1466,6 +1554,17 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_stress.set_ylim(y[0], y[-1])
         ax_stress.set_zlim(z[0], z[-1])
         ax_stress.set_box_aspect([1, 1, 1])
+        ax_stress.tick_params(colors='white')
+        for axis in (ax_stress.xaxis, ax_stress.yaxis, ax_stress.zaxis):
+            try:
+                axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0))
+                axis.pane.set_edgecolor((0.25, 0.25, 0.25, 1.0))
+            except Exception:
+                pass
+            try:
+                axis._axinfo["grid"]["color"] = (0.25, 0.25, 0.25, 1.0)
+            except Exception:
+                pass
         return []
 
     def update(frame_idx):
@@ -1507,6 +1606,20 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_vel.set_zlabel('z [m]')
         ax_vel.set_title(f'Velocity  t = {times[frame_idx]:.2e} s')
         ax_vel.set_box_aspect([1, 1, 1])
+        ax_vel.set_xlim(x[0], x[-1])
+        ax_vel.set_ylim(y[0], y[-1])
+        ax_vel.set_zlim(z[0], z[-1])
+        ax_vel.tick_params(colors='white')
+        for axis in (ax_vel.xaxis, ax_vel.yaxis, ax_vel.zaxis):
+            try:
+                axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0))
+                axis.pane.set_edgecolor((0.25, 0.25, 0.25, 1.0))
+            except Exception:
+                pass
+            try:
+                axis._axinfo["grid"]["color"] = (0.25, 0.25, 0.25, 1.0)
+            except Exception:
+                pass
 
         ax_stress.clear()
         add_fracture_planes(ax_stress)
@@ -1524,6 +1637,20 @@ def animate_elastic_3D(snapshots, times, Nx, Ny, Nz, dx, dy, dz,
         ax_stress.set_zlabel('z [m]')
         ax_stress.set_title(f'Stress·n  t = {times[frame_idx]:.2e} s')
         ax_stress.set_box_aspect([1, 1, 1])
+        ax_stress.set_xlim(x[0], x[-1])
+        ax_stress.set_ylim(y[0], y[-1])
+        ax_stress.set_zlim(z[0], z[-1])
+        ax_stress.tick_params(colors='white')
+        for axis in (ax_stress.xaxis, ax_stress.yaxis, ax_stress.zaxis):
+            try:
+                axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0))
+                axis.pane.set_edgecolor((0.25, 0.25, 0.25, 1.0))
+            except Exception:
+                pass
+            try:
+                axis._axinfo["grid"]["color"] = (0.25, 0.25, 0.25, 1.0)
+            except Exception:
+                pass
 
         return []
 
