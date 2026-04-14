@@ -3,7 +3,9 @@ Classical 3D elastic wave simulation and plotting.
 Combines functionality of main.py, plots.ipynb, and run_elastic_interactive_plot.py.
 
 This version is driven by:
-- `_fractures.py` for material parameters and fracture geometry
+- `_fractures.py` for material constants, `get_grid_parameters`, and `get_grid_size`.
+- Symmetric fracture rho/S models (physical |coord| <= L on each patch) are built here
+  via `build_symmetric_fracture_*` — not the quarter-index helpers in `_fractures.py`.
 - `_initial_conditions.py` for initial wavefield (Gaussian / Ricker)
 
 Usage (examples):
@@ -18,6 +20,7 @@ import os
 import argparse
 import numpy as np
 from scipy.sparse.linalg import expm_multiply
+import matplotlib as mpl
 
 import _fractures as fractures
 import _initial_conditions as initial_conditions
@@ -27,7 +30,185 @@ from _utility import (
     plot_elastic_3D_interactive,
     animate_elastic_3D,
     phi_to_fields_main_grid,
+    create_compliance_matrix_from_velocities,
+    create_compliance_matrix_isotropic,
 )
+
+
+# ---------------------------------------------------------------------------
+# Symmetric fracture models (physical footprint; grid-independent L)
+# ---------------------------------------------------------------------------
+FRACTURE_PATCH_HALF_WIDTH = 0.5  # [m] in-plane |x|,|y|,|z| on each patch (clipped by box)
+
+
+def _fracture_node_coords(xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz):
+    """Node positions; rho_model index (i,j,k) = (z,y,x)."""
+    x = xmin + np.arange(Nx, dtype=np.float64) * dx
+    y = ymin + np.arange(Ny, dtype=np.float64) * dy
+    z = zmin + np.arange(Nz, dtype=np.float64) * dz
+    return x, y, z
+
+
+def _indices_nearest_to_target(line_coords, target=0.0):
+    """All indices whose coordinate is tied for min |coord - target| (symmetric for even N)."""
+    d = np.abs(np.asarray(line_coords, dtype=np.float64) - float(target))
+    dmin = float(np.min(d))
+    return np.flatnonzero(np.isclose(d, dmin, rtol=0.0, atol=1e-12))
+
+
+def _expand_axis_indices(hit, n_axis, thickness):
+    """Union of index ± thickness around each hit (inclusive)."""
+    if thickness <= 0:
+        return np.asarray(np.unique(hit), dtype=int)
+    s = set()
+    for h in np.atleast_1d(hit).ravel():
+        h = int(h)
+        for d in range(-int(thickness), int(thickness) + 1):
+            j = h + d
+            if 0 <= j < int(n_axis):
+                s.add(j)
+    return np.array(sorted(s), dtype=int)
+
+
+def _geom_axis_value_for_overlay(vmin, vmax, target=0.0):
+    """Plane position for drawing: geometric target if inside box, else domain midpoint."""
+    lo, hi = float(vmin), float(vmax)
+    t = float(target)
+    if lo <= t <= hi:
+        return t
+    return 0.5 * (lo + hi)
+
+
+def _fill_S_from_mask(S_model, fracture_mask, S_base, lam_f, mu_f):
+    Nz, Ny, Nx = fracture_mask.shape
+    for i in range(Nz):
+        for j in range(Ny):
+            for k in range(Nx):
+                if fracture_mask[i, j, k]:
+                    S_model[:, :, i, j, k] = create_compliance_matrix_isotropic(lam_f, mu_f)
+                else:
+                    S_model[:, :, i, j, k] = S_base
+
+
+def build_symmetric_fracture_horizontal(
+    xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz, fracture_thickness=0, verbose=True
+):
+    S_base = create_compliance_matrix_from_velocities(
+        fractures.c_p_base, fractures.c_s_base, fractures.rho_base
+    )
+    rho_model = np.full((Nz, Ny, Nx), fractures.rho_base)
+    fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
+    xn, yn, zn = _fracture_node_coords(xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz)
+    L = float(FRACTURE_PATCH_HALF_WIDTH)
+    z_hit = _indices_nearest_to_target(zn, 0.0)
+    z_layers = _expand_axis_indices(z_hit, Nz, fracture_thickness)
+    z_ok = np.zeros(Nz, dtype=bool)
+    z_ok[z_layers] = True
+    if verbose:
+        print(
+            f"\n[classical_plots] Symmetric horizontal: z-indices (nearest z=0) {z_layers.tolist()}, "
+            f"|x|,|y| <= {L} m"
+        )
+    n = 0
+    for i in range(Nz):
+        if not z_ok[i]:
+            continue
+        for j in range(Ny):
+            for k in range(Nx):
+                if abs(xn[k]) <= L + 1e-15 and abs(yn[j]) <= L + 1e-15:
+                    fracture_mask[i, j, k] = True
+                    rho_model[i, j, k] = fractures.rho_fracture
+                    n += 1
+    rho_model = np.clip(rho_model, 1.0, 3000)
+    if verbose:
+        print(f"  Fracture cells: {n} / {Nx * Ny * Nz}")
+    S_model = np.zeros((6, 6, Nz, Ny, Nx))
+    _fill_S_from_mask(
+        S_model, fracture_mask, S_base, fractures.lambda_fracture, fractures.mu_fracture
+    )
+    return rho_model, S_model
+
+
+def build_symmetric_fracture_vertical(
+    xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz, fracture_thickness=0, verbose=True
+):
+    S_base = create_compliance_matrix_from_velocities(
+        fractures.c_p_base, fractures.c_s_base, fractures.rho_base
+    )
+    rho_model = np.full((Nz, Ny, Nx), fractures.rho_base)
+    fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
+    xn, yn, zn = _fracture_node_coords(xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz)
+    L = float(FRACTURE_PATCH_HALF_WIDTH)
+    x_hit = _indices_nearest_to_target(xn, 0.0)
+    x_cols = _expand_axis_indices(x_hit, Nx, fracture_thickness)
+    k_ok = np.zeros(Nx, dtype=bool)
+    k_ok[x_cols] = True
+    if verbose:
+        print(
+            f"\n[classical_plots] Symmetric vertical: x-indices (nearest x=0) {x_cols.tolist()}, "
+            f"|y|,|z| <= {L} m"
+        )
+    n = 0
+    for i in range(Nz):
+        for j in range(Ny):
+            for k in range(Nx):
+                if not k_ok[k]:
+                    continue
+                if abs(yn[j]) <= L + 1e-15 and abs(zn[i]) <= L + 1e-15:
+                    fracture_mask[i, j, k] = True
+                    rho_model[i, j, k] = fractures.rho_fracture
+                    n += 1
+    rho_model = np.clip(rho_model, 1.0, 3000)
+    if verbose:
+        print(f"  Fracture cells: {n} / {Nx * Ny * Nz}")
+    S_model = np.zeros((6, 6, Nz, Ny, Nx))
+    _fill_S_from_mask(
+        S_model, fracture_mask, S_base, fractures.lambda_fracture, fractures.mu_fracture
+    )
+    return rho_model, S_model
+
+
+def build_symmetric_fracture_cross(
+    xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz, fracture_thickness=0, verbose=True
+):
+    S_base = create_compliance_matrix_from_velocities(
+        fractures.c_p_base, fractures.c_s_base, fractures.rho_base
+    )
+    rho_model = np.full((Nz, Ny, Nx), fractures.rho_base)
+    fracture_mask = np.zeros((Nz, Ny, Nx), dtype=bool)
+    xn, yn, zn = _fracture_node_coords(xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz)
+    L = float(FRACTURE_PATCH_HALF_WIDTH)
+    x_hit = _indices_nearest_to_target(xn, 0.0)
+    z_hit = _indices_nearest_to_target(zn, 0.0)
+    x_cols = _expand_axis_indices(x_hit, Nx, fracture_thickness)
+    z_layers = _expand_axis_indices(z_hit, Nz, fracture_thickness)
+    k_ok = np.zeros(Nx, dtype=bool)
+    k_ok[x_cols] = True
+    z_ok = np.zeros(Nz, dtype=bool)
+    z_ok[z_layers] = True
+    if verbose:
+        print(
+            f"\n[classical_plots] Symmetric cross: x-indices {x_cols.tolist()}, z-indices {z_layers.tolist()}, "
+            f"|in-plane| <= {L} m"
+        )
+    n = 0
+    for i in range(Nz):
+        for j in range(Ny):
+            for k in range(Nx):
+                vert = k_ok[k] and abs(yn[j]) <= L + 1e-15 and abs(zn[i]) <= L + 1e-15
+                horiz = z_ok[i] and abs(xn[k]) <= L + 1e-15 and abs(yn[j]) <= L + 1e-15
+                if vert or horiz:
+                    fracture_mask[i, j, k] = True
+                    rho_model[i, j, k] = fractures.rho_fracture
+                    n += 1
+    rho_model = np.clip(rho_model, 1.0, 3000)
+    if verbose:
+        print(f"  Fracture cells: {n} / {Nx * Ny * Nz}")
+    S_model = np.zeros((6, 6, Nz, Ny, Nx))
+    _fill_S_from_mask(
+        S_model, fracture_mask, S_base, fractures.lambda_fracture, fractures.mu_fracture
+    )
+    return rho_model, S_model
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +224,21 @@ SUBSAMPLE = 2
 MAKE_ANIMATION = True  # when MODE is "animation" or "all"
 
 
-def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
+def plot_2d_fields_zslice(
+    phi_real,
+    Nx,
+    Ny,
+    Nz,
+    k,
+    xmin=0.0,
+    ymin=0.0,
+    zmin=0.0,
+    dx=1.0,
+    dy=1.0,
+    dz=1.0,
+    title=None,
+    save_file=None,
+):
     """
     2D imshow grid for a fixed z-slice (k): v_x, v_y, v_z, |v|,
     sigma_xx, sigma_yy, sigma_zz, sigma_xy, sigma_xz, sigma_yz.
@@ -54,6 +249,10 @@ def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
     import matplotlib.pyplot as plt
 
     k = int(np.clip(k, 0, Nz - 1))
+    xmax = xmin + (Nx - 1) * dx
+    ymax = ymin + (Ny - 1) * dy
+    z_plane = zmin + k * dz
+    xy_extent = (xmin, xmax, ymin, ymax)
 
     vxm, vym, vzm, sxx, syy, szz, sxy, sxz, syz = phi_to_fields_main_grid(
         np.real(phi_real), Nx, Ny, Nz
@@ -75,7 +274,12 @@ def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
     }
 
     fig, axes = plt.subplots(2, 5, figsize=(22, 8))
-    fig.suptitle(title or f"Wavefield Components at Z-Slice k={k}", fontsize=16, fontweight="bold")
+    fig.suptitle(
+        title
+        or f"Wavefield at z = {z_plane:.4g} (slice k={k}); x,y in physical coords",
+        fontsize=16,
+        fontweight="bold",
+    )
 
     layout = [
         ("v_x", "Velocity X", "RdBu"),
@@ -95,12 +299,20 @@ def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
         if cmap == "RdBu":
             vmax = float(np.max(np.abs(data)))
             vmax = vmax if vmax > 0 else 1e-10
-            im = ax.imshow(data, cmap=cmap, origin="lower", vmin=-vmax, vmax=vmax)
+            im = ax.imshow(
+                data,
+                cmap=cmap,
+                origin="lower",
+                vmin=-vmax,
+                vmax=vmax,
+                extent=xy_extent,
+                aspect="auto",
+            )
         else:
-            im = ax.imshow(data, cmap=cmap, origin="lower")
+            im = ax.imshow(data, cmap=cmap, origin="lower", extent=xy_extent, aspect="auto")
         ax.set_title(t)
-        ax.set_xlabel("X index")
-        ax.set_ylabel("Y index")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     plt.tight_layout()
@@ -111,7 +323,21 @@ def plot_2d_fields_zslice(phi_real, Nx, Ny, Nz, k, title=None, save_file=None):
         plt.show()
 
 
-def animate_2d_fields_zslice(history, Nx, Ny, Nz, k, output_file="slice_2d.gif", fps=5):
+def animate_2d_fields_zslice(
+    history,
+    Nx,
+    Ny,
+    Nz,
+    k,
+    xmin=0.0,
+    ymin=0.0,
+    zmin=0.0,
+    dx=1.0,
+    dy=1.0,
+    dz=1.0,
+    output_file="slice_2d.gif",
+    fps=5,
+):
     """
     Create a GIF animation of the 2D z-slice over time steps.
     Uses global max scaling per component for consistent colorbars, similar to plots.ipynb.
@@ -123,6 +349,10 @@ def animate_2d_fields_zslice(history, Nx, Ny, Nz, k, output_file="slice_2d.gif",
 
     k = int(np.clip(k, 0, Nz - 1))
     n_steps = len(history)
+    xmax = xmin + (Nx - 1) * dx
+    ymax = ymin + (Ny - 1) * dy
+    z_plane = zmin + k * dz
+    xy_extent = (xmin, xmax, ymin, ymax)
 
     # Precompute frames 
     keys = ["v_x", "v_y", "v_z", "v_mag", "sigma_xx", "sigma_yy", "sigma_zz", "sigma_xy", "sigma_xz", "sigma_yz"]
@@ -163,17 +393,37 @@ def animate_2d_fields_zslice(history, Nx, Ny, Nz, k, output_file="slice_2d.gif",
     images = []
     for t in range(n_steps):
         fig, axes = plt.subplots(2, 5, figsize=(22, 8))
-        fig.suptitle(f"Time Evolution at Z-Slice k={k} (t={t})", fontsize=16, fontweight="bold")
+        fig.suptitle(
+            f"Time evolution, z = {z_plane:.4g} (k={k}), step {t}",
+            fontsize=16,
+            fontweight="bold",
+        )
         for ax, (key, title, cmap) in zip(axes.flatten(), layout):
             data = frames[t][key]
             vmax = global_max[key] if global_max[key] > 0 else 1e-10
             if cmap == "RdBu":
-                im = ax.imshow(data, cmap=cmap, origin="lower", vmin=-vmax, vmax=vmax)
+                im = ax.imshow(
+                    data,
+                    cmap=cmap,
+                    origin="lower",
+                    vmin=-vmax,
+                    vmax=vmax,
+                    extent=xy_extent,
+                    aspect="auto",
+                )
             else:
-                im = ax.imshow(data, cmap=cmap, origin="lower", vmin=0, vmax=vmax)
+                im = ax.imshow(
+                    data,
+                    cmap=cmap,
+                    origin="lower",
+                    vmin=0,
+                    vmax=vmax,
+                    extent=xy_extent,
+                    aspect="auto",
+                )
             ax.set_title(title)
-            ax.set_xlabel("X index")
-            ax.set_ylabel("Y index")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         plt.tight_layout()
         fig.canvas.draw()
@@ -185,7 +435,21 @@ def animate_2d_fields_zslice(history, Nx, Ny, Nz, k, output_file="slice_2d.gif",
     return output_file
 
 
-def plot_2d_slice_html_widget(history, Nx, Ny, Nz, k, output_file="elastic_2D_slice.html", interval=200):
+def plot_2d_slice_html_widget(
+    history,
+    Nx,
+    Ny,
+    Nz,
+    k,
+    xmin=0.0,
+    ymin=0.0,
+    zmin=0.0,
+    dx=1.0,
+    dy=1.0,
+    dz=1.0,
+    output_file="elastic_2D_slice.html",
+    interval=200,
+):
     """
     Same as the notebook's plot_time_slider: build 2D z-slice frames, create
     FuncAnimation, and save the animation as an HTML widget (to_jshtml()) to a file.
@@ -198,6 +462,10 @@ def plot_2d_slice_html_widget(history, Nx, Ny, Nz, k, output_file="elastic_2D_sl
 
     k = int(np.clip(k, 0, Nz - 1))
     n_steps = len(history)
+    xmax = xmin + (Nx - 1) * dx
+    ymax = ymin + (Ny - 1) * dy
+    z_plane = zmin + k * dz
+    xy_extent = (xmin, xmax, ymin, ymax)
 
     keys = ["v_x", "v_y", "v_z", "v_mag", "sigma_xx", "sigma_yy", "sigma_zz", "sigma_xy", "sigma_xz", "sigma_yz"]
     global_max = {key: 0.0 for key in keys}
@@ -223,15 +491,35 @@ def plot_2d_slice_html_widget(history, Nx, Ny, Nz, k, output_file="elastic_2D_sl
     ]
 
     fig, axes = plt.subplots(2, 5, figsize=(22, 9))
-    title_text = fig.suptitle(f"Time Evolution at Z-Slice k={k} (t=0)", fontsize=16, fontweight="bold")
+    title_text = fig.suptitle(
+        f"Time evolution, z = {z_plane:.4g} (k={k}) (t=0)",
+        fontsize=16,
+        fontweight="bold",
+    )
     images = {}
     for ax, (key, title, cmap) in zip(axes.flatten(), layout):
         data = frames[0][key]
         vmax = global_max[key] if global_max[key] > 0 else 1e-10
         if cmap == "RdBu":
-            im = ax.imshow(data, cmap=cmap, origin="lower", vmin=-vmax, vmax=vmax)
+            im = ax.imshow(
+                data,
+                cmap=cmap,
+                origin="lower",
+                vmin=-vmax,
+                vmax=vmax,
+                extent=xy_extent,
+                aspect="auto",
+            )
         else:
-            im = ax.imshow(data, cmap=cmap, origin="lower", vmin=0, vmax=vmax)
+            im = ax.imshow(
+                data,
+                cmap=cmap,
+                origin="lower",
+                vmin=0,
+                vmax=vmax,
+                extent=xy_extent,
+                aspect="auto",
+            )
         ax.set_title(title)
         ax.set_xlabel("x")
         ax.set_ylabel("y")
@@ -241,7 +529,7 @@ def plot_2d_slice_html_widget(history, Nx, Ny, Nz, k, output_file="elastic_2D_sl
     plt.tight_layout()
 
     def update(t):
-        title_text.set_text(f"Time Evolution at Z-Slice k={k} (t={t})")
+        title_text.set_text(f"Time evolution, z = {z_plane:.4g} (k={k}) (t={t})")
         for key in images:
             images[key].set_data(frames[t][key])
         return list(images.values())
@@ -379,10 +667,29 @@ def main():
     parser.add_argument("--slice-html", default="elastic_2D_slice.html", help="Output HTML widget for 2D slice (slider+play, like notebook); open in browser")
     parser.add_argument("--fracture-geometry", choices=["horizontal", "vertical", "cross"],
                         default="horizontal",
-                        help="Fracture geometry from _fractures: one_horizontal, one_vertical, two_perpendicular")
+                        help="Symmetric fracture model in classical_plots (FRACTURE_PATCH_HALF_WIDTH)")
     parser.add_argument("--subsample", type=int, default=SUBSAMPLE, help="Subsample factor for 3D plots")
     parser.add_argument("--no-verbose", action="store_true", help="Reduce console output")
     args = parser.parse_args()
+
+    # Dark theme: black backgrounds and dark-grey grid lines.
+    # This affects both the 2D plots created here and the figures created in _utility.
+    mpl.rcParams.update(
+        {
+            "figure.facecolor": "black",
+            "axes.facecolor": "black",
+            "savefig.facecolor": "black",
+            "axes.edgecolor": "0.8",
+            "axes.labelcolor": "white",
+            "xtick.color": "white",
+            "ytick.color": "white",
+            "text.color": "white",
+            "grid.color": "0.25",
+            "grid.alpha": 0.6,
+            "grid.linewidth": 0.8,
+            "axes.grid": True,
+        }
+    )
 
     verbose = not args.no_verbose
     n_steps = args.steps
@@ -405,57 +712,33 @@ def main():
         dz,
     ) = fractures.get_grid_parameters()
     if args.fracture_geometry == "vertical":
-        rho_model, S = fractures.one_vertical_fracture(Nx, Ny, Nz, dx, dy, dz)
+        rho_model, S = build_symmetric_fracture_vertical(
+            xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz, verbose=verbose
+        )
     elif args.fracture_geometry == "cross":
-        rho_model, S = fractures.two_perpendicular_fractures(Nx, Ny, Nz, dx, dy, dz)
+        rho_model, S = build_symmetric_fracture_cross(
+            xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz, verbose=verbose
+        )
     else:
-        rho_model, S = fractures.one_horizontal_fracture(Nx, Ny, Nz, dx, dy, dz)
+        rho_model, S = build_symmetric_fracture_horizontal(
+            xmin, ymin, zmin, Nx, Ny, Nz, dx, dy, dz, verbose=verbose
+        )
 
-    # Build fracture plane list for 3D plots from the density model (rho == rho_fracture).
-    # Use one plane per orientation: the z-slice and x-slice that contain the most fracture
-    # cells (so we get a single cross, not a grid of planes). Also compute the in-plane
-    # extents from the fracture mask so that the plotted planes match the physical
-    # fracture size (do not reach the domain edges).
+    # Overlays at geometric x=0, z=0 (not mid-grid nodes) so the cross stays centered for any N.
     fracture_planes = []
-    try:
-        rho_frac_val = float(fractures.rho_fracture)
-    except Exception:
-        rho_frac_val = None
-    if rho_frac_val is not None:
-        frac_mask = np.isclose(rho_model, rho_frac_val)
-        x_phys = np.arange(Nx) * dx - (Nx - 1) * dx / 2
-        y_phys = np.arange(Ny) * dy - (Ny - 1) * dy / 2
-        z_phys = np.arange(Nz) * dz - (Nz - 1) * dz / 2
-        # One z-plane: the z-index with the most fracture cells (main horizontal plane)
-        n_frac_per_z = np.sum(frac_mask, axis=(1, 2))
-        if args.fracture_geometry in ("horizontal", "cross") and np.any(n_frac_per_z > 0):
-            iz = int(np.argmax(n_frac_per_z))
-            # Limit plane in x,y to where fractures actually exist
-            mask_z = frac_mask[iz, :, :]  # (Ny, Nx)
-            ys_nonzero = np.where(np.any(mask_z, axis=1))[0]
-            xs_nonzero = np.where(np.any(mask_z, axis=0))[0]
-            if ys_nonzero.size > 0 and xs_nonzero.size > 0:
-                y_min, y_max = y_phys[ys_nonzero[0]], y_phys[ys_nonzero[-1]]
-                x_min, x_max = x_phys[xs_nonzero[0]], x_phys[xs_nonzero[-1]]
-                # Entry: (axis, coord, x_min, x_max, y_min, y_max)
-                fracture_planes.append(
-                    ("z", float(z_phys[iz]), float(x_min), float(x_max), float(y_min), float(y_max))
-                )
-        # One x-plane: the x-index with the most fracture cells (main vertical plane)
-        n_frac_per_x = np.sum(frac_mask, axis=(0, 1))
-        if args.fracture_geometry in ("vertical", "cross") and np.any(n_frac_per_x > 0):
-            ix = int(np.argmax(n_frac_per_x))
-            # Limit plane in y,z to where fractures actually exist
-            mask_x = frac_mask[:, :, ix]  # (Nz, Ny)
-            zs_nonzero = np.where(np.any(mask_x, axis=1))[0]
-            ys_nonzero = np.where(np.any(mask_x, axis=0))[0]
-            if zs_nonzero.size > 0 and ys_nonzero.size > 0:
-                z_min, z_max = z_phys[zs_nonzero[0]], z_phys[zs_nonzero[-1]]
-                y_min, y_max = y_phys[ys_nonzero[0]], y_phys[ys_nonzero[-1]]
-                # Entry: (axis, coord, z_min, z_max, y_min, y_max)
-                fracture_planes.append(
-                    ("x", float(x_phys[ix]), float(z_min), float(z_max), float(y_min), float(y_max))
-                )
+    x_phys = xmin + np.arange(Nx) * dx
+    y_phys = ymin + np.arange(Ny) * dy
+    z_phys = zmin + np.arange(Nz) * dz
+    L = float(FRACTURE_PATCH_HALF_WIDTH)
+    xh0, xh1 = max(float(xmin), -L), min(float(xmax), L)
+    yh0, yh1 = max(float(ymin), -L), min(float(ymax), L)
+    zh0, zh1 = max(float(zmin), -L), min(float(zmax), L)
+    x_plane = _geom_axis_value_for_overlay(xmin, xmax, 0.0)
+    z_plane = _geom_axis_value_for_overlay(zmin, zmax, 0.0)
+    if args.fracture_geometry in ("horizontal", "cross"):
+        fracture_planes.append(("z", z_plane, xh0, xh1, yh0, yh1))
+    if args.fracture_geometry in ("vertical", "cross"):
+        fracture_planes.append(("x", x_plane, zh0, zh1, yh0, yh1))
 
     N_main, N_vx, N_vy, N_vz, N_sxy, N_sxz, N_syz, N_vel, N_stress, N_total = fractures.get_grid_size(
         Nx, Ny, Nz
@@ -489,16 +772,26 @@ def main():
         verbose=verbose,
     )
 
-    fracture1_z, fracture2_x = Nz // 2, Nx // 2
+    # Legacy indices for _utility fallbacks: nodes closest to x=0, z=0 (first if tied).
+    fracture1_z = int(_indices_nearest_to_target(z_phys, 0.0)[0])
+    fracture2_x = int(_indices_nearest_to_target(x_phys, 0.0)[0])
 
     # 2D slice plots (static PNG; optional GIF if we have snapshots)
     if args.plots_2d:
         k2d = (Nz // 2) if args.slice_k is None else int(args.slice_k)
         plot_2d_fields_zslice(
             phi_real,
-            Nx, Ny, Nz,
+            Nx,
+            Ny,
+            Nz,
             k=k2d,
-            title=f"Wavefield Components at Z-Slice k={k2d} (t={t_final:.2e}s)",
+            xmin=xmin,
+            ymin=ymin,
+            zmin=zmin,
+            dx=dx,
+            dy=dy,
+            dz=dz,
+            title=f"Wavefield at t={t_final:.2e}s",
             save_file=args.slice_out,
         )
         if verbose:
@@ -506,8 +799,16 @@ def main():
         if snapshots:
             animate_2d_fields_zslice(
                 snapshots,
-                Nx, Ny, Nz,
+                Nx,
+                Ny,
+                Nz,
                 k=k2d,
+                xmin=xmin,
+                ymin=ymin,
+                zmin=zmin,
+                dx=dx,
+                dy=dy,
+                dz=dz,
                 output_file=args.slice_gif,
                 fps=5,
             )
@@ -516,7 +817,17 @@ def main():
             # HTML widget (same as notebook's plot_time_slider / to_jshtml): slider + play in browser
             html_path = os.path.join(os.path.dirname(__file__) or ".", args.slice_html)
             plot_2d_slice_html_widget(
-                snapshots, Nx, Ny, Nz, k=k2d,
+                snapshots,
+                Nx,
+                Ny,
+                Nz,
+                k=k2d,
+                xmin=xmin,
+                ymin=ymin,
+                zmin=zmin,
+                dx=dx,
+                dy=dy,
+                dz=dz,
                 output_file=html_path,
                 interval=200,
             )
@@ -552,6 +863,9 @@ def main():
             scale_stress=scale_stress,
             show_velocity=True,
             show_stress=True,
+            xmin=xmin,
+            ymin=ymin,
+            zmin=zmin,
         )
         if verbose:
             print(f"Saved static plot: {args.output_image}")
@@ -574,6 +888,9 @@ def main():
             fracture_planes=fracture_planes,
             subsample=args.subsample,
             save_file=None,
+            xmin=xmin,
+            ymin=ymin,
+            zmin=zmin,
         )
 
     # GIF animation
@@ -596,6 +913,9 @@ def main():
             subsample=args.subsample,
             output_file=gif_path,
             fps=10,
+            xmin=xmin,
+            ymin=ymin,
+            zmin=zmin,
         )
         if verbose:
             print(f"Saved animation: {gif_path}")
