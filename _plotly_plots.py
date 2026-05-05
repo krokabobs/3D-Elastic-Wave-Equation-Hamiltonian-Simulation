@@ -18,10 +18,13 @@ plot_3d_velocity_plotly_log
 
 
 
-def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, dx, dy, dz):
+def plot_time_slider_plotly(k_fixed, sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, dx, dy, dz):
     # Safety check for k
     k_fixed = max(0, min(k_fixed, Nz - 1))
-    n_steps = len(history)
+    
+    # Efficiently convert the entire solution matrix to the physical basis in one step
+    psi_matrix = B_sqrt @ sol.y
+    n_steps = psi_matrix.shape[1]
     
     # Calculate the physical z-coordinate for the title
     z_phys = zmin + k_fixed * dz
@@ -46,7 +49,7 @@ def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax
 
     # 1. Pre-process and extract all data
     for t in range(n_steps):
-        phi = history[t]
+        phi = psi_matrix[:, t]
         idx = 0
         
         # --- Unpacking ---
@@ -118,7 +121,6 @@ def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax
     
     titles = [item[1] for item in layout_keys]
     
-    # Subplot spacing configuration
     cols, rows = 5, 2
     h_space, v_space = 0.07, 0.15
     col_width = (1.0 - (cols - 1) * h_space) / cols
@@ -138,9 +140,8 @@ def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax
         vmax = global_max[key] if global_max[key] != 0 else 1e-10
         zmin_val = -vmax if cmap == 'RdBu' else 0
 
-        # Calculate exact colorbar position to drop it in the subplot gutters
         col_idx = col - 1
-        row_idx = rows - row # Plotly y-axis starts from bottom
+        row_idx = rows - row 
         
         cb_x = col_idx * (col_width + h_space) + col_width + 0.005
         cb_y = row_idx * (row_height + v_space) + (row_height / 2)
@@ -158,18 +159,18 @@ def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax
     for t in range(n_steps):
         frame_traces = []
         for key, _, _ in layout_keys:
-            # We only need to update the z-data for each frame
             frame_traces.append(go.Heatmap(z=all_frames_data[t][key]))
         frames.append(go.Frame(data=frame_traces, name=str(t)))
 
     fig.frames = frames
 
     # 5. Add UI Controls
+    # We now use sol.t to display actual time (in scientific notation) on the slider!
     sliders = [dict(
         steps=[dict(
             method='animate',
             args=[[str(t)], dict(mode='immediate', frame=dict(duration=200, redraw=True), transition=dict(duration=0))],
-            label=f'Step {t}'
+            label=f't = {sol.t[t]:.2e}s'
         ) for t in range(n_steps)],
         active=0,
         x=0.08, y=-0.15, xanchor='left', yanchor='top'
@@ -177,7 +178,7 @@ def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax
 
     fig.update_layout(
         title=f'Time Evolution at Z-Slice {z_phys:.3f} (k={k_fixed})',
-        width=1100,  # Wide format to accommodate 5 columns
+        width=1100, 
         height=550,
         margin=dict(l=20, r=20, t=60, b=20),
         sliders=sliders,
@@ -190,11 +191,6 @@ def plot_time_slider_plotly(k_fixed, history, xmin, ymin, zmin, xmax, ymax, zmax
             ]
         )]
     )
-
-    # Clean up axis titles slightly for the grid
-    #for ax in fig.layout:
-       #if ax.startswith('xaxis'): fig.layout[ax].title = 'x'
-        #if ax.startswith('yaxis'): fig.layout[ax].title = 'y'
 
     return fig
 
@@ -234,7 +230,11 @@ def get_3d_velocities(phi, Nx, Ny, Nz):
 
 
 
-def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz):
+def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz):
+    # Convert all states at once
+    psi_matrix = B_sqrt @ sol.y
+    n_steps = psi_matrix.shape[1]
+
     # Create the coordinate grid
     x_vals = np.linspace(xmin, xmax, Nx)
     y_vals = np.linspace(ymin, ymax, Ny)
@@ -245,9 +245,10 @@ def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny,
     y_f = Y_grid.flatten()
     z_f = Z_grid.flatten()
 
-    # First pass: find global maximum magnitude for consistent color scaling across all time steps
+    # First pass: find global maximum magnitude
     global_max_mag = 0
-    for phi in history:
+    for t in range(n_steps):
+        phi = psi_matrix[:, t]
         vx, vy, vz = get_3d_velocities(phi, Nx, Ny, Nz)
         mag = np.sqrt(vx**2 + vy**2 + vz**2)
         global_max_mag = max(global_max_mag, np.max(mag))
@@ -258,14 +259,14 @@ def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny,
     frames = []
     init_u, init_v, init_w = None, None, None
 
-    # Second pass: Build animation frames with TRUE vector lengths
-    for t, phi in enumerate(history):
+    # Second pass: Build animation frames
+    for t in range(n_steps):
+        phi = psi_matrix[:, t]
         vx, vy, vz = get_3d_velocities(phi, Nx, Ny, Nz)
         u = vx.flatten()
         v = vy.flatten()
         w = vz.flatten()
 
-        # Save the first step for the initial plot rendering
         if t == 0:
             init_u, init_v, init_w = u, v, w
 
@@ -273,7 +274,6 @@ def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny,
             data=[go.Cone(
                 x=x_f, y=y_f, z=z_f,
                 u=u, v=v, w=w
-                # Notice: No 'color' argument here. Plotly handles color automatically via (u,v,w)
             )],
             name=str(t)
         ))
@@ -286,28 +286,28 @@ def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny,
             colorscale='Viridis',
             cmin=0, cmax=global_max_mag,
             sizemode='scaled',
-            sizeref=1, # Adjust this value (e.g., 0.5 or 2) if the cones are too big or too small
+            sizeref=1, 
             colorbar=dict(title='Velocity Magnitude')
         )],
         frames=frames
     )
 
-    # Configure the slider and play/pause buttons
+    # Configure the slider with actual timestamps
     sliders = [dict(
         steps=[dict(
             method='animate',
             args=[[str(t)], dict(mode='immediate', frame=dict(duration=200, redraw=True), transition=dict(duration=0))],
-            label=f'Step {t}'
-        ) for t in range(len(history))],
+            label=f'{sol.t[t]:.2e}s'
+        ) for t in range(n_steps)],
         active=0,
         x=0.1, y=0, xanchor='left', yanchor='top'
     )]
 
     fig.update_layout(
         title='3D Velocity Vector Field (Plotly)',
-        width=1000,   # <--- Increase this for a wider plot
-        height=800,   # <--- Increase this for a taller plot
-        margin=dict(l=10, r=10, b=10, t=50), # <--- Reduces white space around the edges
+        width=1000,   
+        height=800,   
+        margin=dict(l=10, r=10, b=10, t=50), 
         scene=dict(
             xaxis_title='X',
             yaxis_title='Y',
@@ -319,16 +319,11 @@ def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny,
         ),
         sliders=sliders,
         updatemenus=[dict(
-            type='buttons',
-            showactive=False,
+            type='buttons', showactive=False,
             y=0, x=0, xanchor='left', yanchor='top',
             buttons=[
-                dict(label='Play',
-                     method='animate',
-                     args=[None, dict(frame=dict(duration=200, redraw=True), transition=dict(duration=0), fromcurrent=True, mode='immediate')]),
-                dict(label='Pause',
-                     method='animate',
-                     args=[[None], dict(frame=dict(duration=0, redraw=False), mode='immediate', transition=dict(duration=0))])
+                dict(label='Play', method='animate', args=[None, dict(frame=dict(duration=200, redraw=True), transition=dict(duration=0), fromcurrent=True, mode='immediate')]),
+                dict(label='Pause', method='animate', args=[[None], dict(frame=dict(duration=0, redraw=False), mode='immediate', transition=dict(duration=0))])
             ]
         )]
     )
@@ -337,7 +332,11 @@ def plot_3d_velocity_plotly(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny,
 
 
 
-def plot_3d_velocity_plotly_log(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, log_boost=1000):
+def plot_3d_velocity_plotly_log(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, log_boost=1000):
+    # Convert all states at once
+    psi_matrix = B_sqrt @ sol.y
+    n_steps = psi_matrix.shape[1]
+
     x_vals = np.linspace(xmin, xmax, Nx)
     y_vals = np.linspace(ymin, ymax, Ny)
     z_vals = np.linspace(zmin, zmax, Nz)
@@ -349,7 +348,8 @@ def plot_3d_velocity_plotly_log(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
 
     # 1. Find global maximum magnitude across all frames
     global_max_mag = 0
-    for phi in history:
+    for t in range(n_steps):
+        phi = psi_matrix[:, t]
         vx, vy, vz = get_3d_velocities(phi, Nx, Ny, Nz)
         mag = np.sqrt(vx**2 + vy**2 + vz**2)
         global_max_mag = max(global_max_mag, np.max(mag))
@@ -361,30 +361,25 @@ def plot_3d_velocity_plotly_log(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
     init_u, init_v, init_w = None, None, None
 
     # 2. Build animation frames with Log-Scaled vectors
-    for t, phi in enumerate(history):
+    for t in range(n_steps):
+        phi = psi_matrix[:, t]
         vx, vy, vz = get_3d_velocities(phi, Nx, Ny, Nz)
         u_raw, v_raw, w_raw = vx.flatten(), vy.flatten(), vz.flatten()
         mag = np.sqrt(u_raw**2 + v_raw**2 + w_raw**2)
 
-        # Handle zero division safely
         with np.errstate(divide='ignore', invalid='ignore'):
             safe_mag = np.where(mag == 0, 1e-12, mag)
             
-            # Extract pure direction (unit vectors)
             u_dir = u_raw / safe_mag
             v_dir = v_raw / safe_mag
             w_dir = w_raw / safe_mag
 
-            # Apply logarithmic scaling: log10(1 + C * (mag / max_mag))
-            # This makes the max value = log10(1 + log_boost) and 0 = 0.
             log_mag = np.log10(1 + log_boost * (mag / global_max_mag))
 
-            # Re-apply the log magnitude to the direction vectors
             u_log = u_dir * log_mag
             v_log = v_dir * log_mag
             w_log = w_dir * log_mag
             
-            # Catch any NaNs from the zero-handling just in case
             u_log = np.nan_to_num(u_log)
             v_log = np.nan_to_num(v_log)
             w_log = np.nan_to_num(w_log)
@@ -398,17 +393,9 @@ def plot_3d_velocity_plotly_log(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
         ))
 
     # 3. Create Custom Colorbar Ticks
-    # We want the colorbar to map the log scale back to readable TRUE values.
     max_log_val = np.log10(1 + log_boost)
-    
-    # Let's create 6 tick marks evenly spaced in the log space
     tick_vals_log = np.linspace(0, max_log_val, 6)
-    
-    # Reverse the math to figure out what true magnitude each tick represents
-    # log_val = log10(1 + boost * (true / max))  =>  true = max * ((10^log_val - 1) / boost)
     tick_vals_true = global_max_mag * ((10**tick_vals_log - 1) / log_boost)
-    
-    # Format them as scientific notation for the UI
     tick_texts = [f"{val:.2e}" for val in tick_vals_true]
 
     # 4. Build the base figure
@@ -417,9 +404,9 @@ def plot_3d_velocity_plotly_log(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
             x=x_f, y=y_f, z=z_f,
             u=init_u, v=init_v, w=init_w,
             colorscale='Viridis',
-            cmin=0, cmax=max_log_val, # Lock colors to our calculated log boundaries
+            cmin=0, cmax=max_log_val,
             sizemode='scaled',
-            sizeref=0.5, # Adjust this depending on how much the vectors overlap
+            sizeref=0.5, 
             colorbar=dict(
                 title='True Velocity Magnitude',
                 tickmode='array',
@@ -430,13 +417,13 @@ def plot_3d_velocity_plotly_log(history, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
         frames=frames
     )
 
-    # 5. Configure UI Layout
+    # 5. Configure UI Layout with actual timestamps
     sliders = [dict(
         steps=[dict(
             method='animate',
             args=[[str(t)], dict(mode='immediate', frame=dict(duration=200, redraw=True), transition=dict(duration=0))],
-            label=f'Step {t}'
-        ) for t in range(len(history))],
+            label=f'{sol.t[t]:.2e}s'
+        ) for t in range(n_steps)],
         active=0,
         x=0.1, y=0, xanchor='left', yanchor='top'
     )]
