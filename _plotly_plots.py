@@ -230,7 +230,7 @@ def get_3d_velocities(phi, Nx, Ny, Nz):
 
 
 
-def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz):
+def plot_3d_velocity_plotly(sol, B_sqrt, rho_model, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, dx, dy, dz):
     # Convert all states at once
     psi_matrix = B_sqrt @ sol.y
     n_steps = psi_matrix.shape[1]
@@ -245,7 +245,29 @@ def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
     y_f = Y_grid.flatten()
     z_f = Z_grid.flatten()
 
-    # First pass: find global maximum magnitude
+    # --- CONTINUOUS-LOOKING SCATTER TRACE ---
+    z_idx, y_idx, x_idx = np.where(rho_model < 2700)
+    frac_x = xmin + x_idx * dx
+    frac_y = ymin + y_idx * dy
+    frac_z = zmin + z_idx * dz
+    
+    fracture_trace = go.Scatter3d(
+        x=frac_x, y=frac_y, z=frac_z,
+        mode='markers',
+        marker=dict(
+            size=20,             # Large enough to overlap neighboring cells
+            color='gray',        
+            symbol='square',     # Squares pack together better into walls
+            opacity=0.3,        # Low opacity makes overlapping markers look like a smooth solid
+            line=dict(width=0)   # Remove marker borders so they blend seamlessly
+        ),
+        name='Fracture Geometry',
+        showlegend=True,
+        hoverinfo='skip'         
+    )
+    # -----------------------------------------
+
+    # First pass: find global maximum magnitude for consistent color scaling across all time steps
     global_max_mag = 0
     for t in range(n_steps):
         phi = psi_matrix[:, t]
@@ -259,7 +281,7 @@ def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
     frames = []
     init_u, init_v, init_w = None, None, None
 
-    # Second pass: Build animation frames
+    # Second pass: Build animation frames with TRUE vector lengths
     for t in range(n_steps):
         phi = psi_matrix[:, t]
         vx, vy, vz = get_3d_velocities(phi, Nx, Ny, Nz)
@@ -267,6 +289,7 @@ def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
         v = vy.flatten()
         w = vz.flatten()
 
+        # Save the first step for the initial plot rendering
         if t == 0:
             init_u, init_v, init_w = u, v, w
 
@@ -278,19 +301,21 @@ def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
             name=str(t)
         ))
 
-    # Build the base figure
-    fig = go.Figure(
-        data=[go.Cone(
-            x=x_f, y=y_f, z=z_f,
-            u=init_u, v=init_v, w=init_w,
-            colorscale='Viridis',
-            cmin=0, cmax=global_max_mag,
-            sizemode='scaled',
-            sizeref=1, 
-            colorbar=dict(title='Velocity Magnitude')
-        )],
-        frames=frames
+    # Build the base figure cone trace
+    cone_trace = go.Cone(
+        x=x_f, y=y_f, z=z_f,
+        u=init_u, v=init_v, w=init_w,
+        colorscale='Viridis',
+        cmin=0, cmax=global_max_mag,
+        sizemode='scaled',
+        sizeref=1, # Adjust this value (e.g., 0.5 or 2) if the cones are too big or too small
+        colorbar=dict(title='Velocity Magnitude'),
+        name='Velocity',
+        showlegend=False # Hide the cones from the legend to keep the UI clean
     )
+    
+    # Pass both traces to the main figure
+    fig = go.Figure(data=[cone_trace, fracture_trace], frames=frames)
 
     # Configure the slider with actual timestamps
     sliders = [dict(
@@ -318,8 +343,17 @@ def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
             aspectmode='data'
         ),
         sliders=sliders,
+        showlegend=True, 
+        legend=dict(
+            orientation="h",   # Make the legend horizontal
+            yanchor="top",
+            y=0.95,            # Pushes it just below the title
+            xanchor="left",
+            x=0.05             # Puts it on the top-left side
+        ),
         updatemenus=[dict(
-            type='buttons', showactive=False,
+            type='buttons',
+            showactive=False,
             y=0, x=0, xanchor='left', yanchor='top',
             buttons=[
                 dict(label='Play', method='animate', args=[None, dict(frame=dict(duration=200, redraw=True), transition=dict(duration=0), fromcurrent=True, mode='immediate')]),
@@ -332,11 +366,12 @@ def plot_3d_velocity_plotly(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx,
 
 
 
-def plot_3d_velocity_plotly_log(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, log_boost=1000):
+def plot_3d_velocity_plotly_log(sol, B_sqrt, rho_model, xmin, ymin, zmin, xmax, ymax, zmax, Nx, Ny, Nz, dx, dy, dz, log_boost=1000):
     # Convert all states at once
     psi_matrix = B_sqrt @ sol.y
     n_steps = psi_matrix.shape[1]
 
+    # Create the coordinate grid for the cones
     x_vals = np.linspace(xmin, xmax, Nx)
     y_vals = np.linspace(ymin, ymax, Ny)
     z_vals = np.linspace(zmin, zmax, Nz)
@@ -345,6 +380,28 @@ def plot_3d_velocity_plotly_log(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax,
     x_f = X_grid.flatten()
     y_f = Y_grid.flatten()
     z_f = Z_grid.flatten()
+
+    # --- CONTINUOUS-LOOKING SCATTER TRACE ---
+    z_idx, y_idx, x_idx = np.where(rho_model < 2700)
+    frac_x = xmin + x_idx * dx
+    frac_y = ymin + y_idx * dy
+    frac_z = zmin + z_idx * dz
+    
+    fracture_trace = go.Scatter3d(
+        x=frac_x, y=frac_y, z=frac_z,
+        mode='markers',
+        marker=dict(
+            size=20,             # Large enough to overlap neighboring cells
+            color='gray',        
+            symbol='square',     # Squares pack together better into walls
+            opacity=0.3,        # Low opacity makes overlapping markers look like a smooth solid
+            line=dict(width=0)   # Remove marker borders so they blend seamlessly
+        ),
+        name='Fracture Geometry',
+        showlegend=True,
+        hoverinfo='skip'         
+    )
+    # -----------------------------------------
 
     # 1. Find global maximum magnitude across all frames
     global_max_mag = 0
@@ -387,6 +444,8 @@ def plot_3d_velocity_plotly_log(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax,
         if t == 0:
             init_u, init_v, init_w = u_log, v_log, w_log
 
+        # Notice we ONLY put the Cone trace in the frames. 
+        # Plotly will automatically leave the static fracture trace alone.
         frames.append(go.Frame(
             data=[go.Cone(x=x_f, y=y_f, z=z_f, u=u_log, v=v_log, w=w_log)],
             name=str(t)
@@ -398,24 +457,26 @@ def plot_3d_velocity_plotly_log(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax,
     tick_vals_true = global_max_mag * ((10**tick_vals_log - 1) / log_boost)
     tick_texts = [f"{val:.2e}" for val in tick_vals_true]
 
-    # 4. Build the base figure
-    fig = go.Figure(
-        data=[go.Cone(
-            x=x_f, y=y_f, z=z_f,
-            u=init_u, v=init_v, w=init_w,
-            colorscale='Viridis',
-            cmin=0, cmax=max_log_val,
-            sizemode='scaled',
-            sizeref=0.5, 
-            colorbar=dict(
-                title='True Velocity Magnitude',
-                tickmode='array',
-                tickvals=tick_vals_log,
-                ticktext=tick_texts
-            )
-        )],
-        frames=frames
+    # 4. Build the base figure (ADDING FRACTURE TRACE HERE)
+    cone_trace = go.Cone(
+        x=x_f, y=y_f, z=z_f,
+        u=init_u, v=init_v, w=init_w,
+        colorscale='Viridis',
+        cmin=0, cmax=max_log_val,
+        sizemode='scaled',
+        sizeref=0.5, 
+        colorbar=dict(
+            title='True Velocity Magnitude',
+            tickmode='array',
+            tickvals=tick_vals_log,
+            ticktext=tick_texts
+        ),
+        name='Velocity',
+        showlegend=False # Hide the cones from the legend to keep the UI clean
     )
+    
+    # We pass both the moving cone_trace and the static fracture_trace to the base figure
+    fig = go.Figure(data=[cone_trace, fracture_trace], frames=frames)
 
     # 5. Configure UI Layout with actual timestamps
     sliders = [dict(
@@ -441,6 +502,14 @@ def plot_3d_velocity_plotly_log(sol, B_sqrt, xmin, ymin, zmin, xmax, ymax, zmax,
             aspectmode='data'
         ),
         sliders=sliders,
+        showlegend=True, 
+        legend=dict(
+            orientation="h",   # Make the legend horizontal
+            yanchor="top",
+            y=0.95,            # Pushes it just below the title
+            xanchor="left",
+            x=0.05             # Puts it on the top-left side
+        ),
         updatemenus=[dict(
             type='buttons', showactive=False, y=0, x=0, xanchor='left', yanchor='top',
             buttons=[
