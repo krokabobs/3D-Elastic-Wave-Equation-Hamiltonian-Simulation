@@ -41,56 +41,6 @@ def gaussian_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
 
     return phi_0
 
-'''
-def ricker_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
-
-    N_main,N_vx,N_vy,N_vz,N_sxy,N_sxz,N_syz,N_vel,N_stress,psi_len = get_grid_size(Nx,Ny,Nz)
-
-
-    f0 = 2.0            # Central frequency of the Ricker wavelet
-    x0, y0, z0 = 0, 0, 0   # Wavelet center
-    x_vx = np.linspace(xmin+dx/2,xmax-dx/2,Nx-1)
-    y_vx = np.linspace(ymin,ymax,Ny)
-    z_vx = np.linspace(zmin,zmax,Nz)
-
-    X_vx, Y_vx, Z_vx = np.meshgrid(x_vx, y_vx, z_vx, indexing='ij')
-
-    #print(X_vx)
-
-    # Initialize velocity components (all zeros initially)
-    v0x = np.zeros((Nx-1, Ny, Nz))
-    v0y = np.zeros((Nx, Ny-1, Nz))
-    v0z = np.zeros((Nx, Ny, Nz-1))
-
-    # Initialize stress components (all zeros initially)
-    sigma_xx = np.zeros((Nx, Ny, Nz))
-    sigma_yy = np.zeros((Nx, Ny, Nz))
-    sigma_zz = np.zeros((Nx, Ny, Nz))
-    sigma_xy = np.zeros((Nx-1, Ny-1, Nz))
-    sigma_xz = np.zeros((Nx-1, Ny, Nz-1))
-    sigma_yz = np.zeros((Nx, Ny-1, Nz-1))
-
-    # Add a Ricker wavelet source to v_x component similarly to the acoustic case
-    # Ricker function takes (f, x, y, z, x0, y0, z0) and returns a scalar or array
-    ricker_vx = Ricker(f0, X_vx, Y_vx, Z_vx, x0, y0, z0)
-    #print(ricker_vx)
-    v0x = np.round(ricker_vx, 20)
-    #print(v0x.flatten())
-    # Stack the initial conditions in the correct order:
-    # [v_x, v_y, v_z, σ_xx, σ_yy, σ_zz, σ_xy, σ_xz, σ_yz]
-    phi_0 = np.concatenate([
-        v0x.flatten(),      # v_x: (Nx-1)*Ny*Nz
-        v0y.flatten(),      # v_y: Nx*(Ny-1)*Nz
-        v0z.flatten(),      # v_z: Nx*Ny*(Nz-1)
-        sigma_xx.flatten(), # σ_xx: Nx*Ny*Nz
-        sigma_yy.flatten(), # σ_yy: Nx*Ny*Nz
-        sigma_zz.flatten(), # σ_zz: Nx*Ny*Nz
-        sigma_xy.flatten(), # σ_xy: (Nx-1)*(Ny-1)*Nz
-        sigma_xz.flatten(), # σ_xz: (Nx-1)*Ny*(Nz-1)
-        sigma_yz.flatten()  # σ_yz: Nx*(Ny-1)*(Nz-1)
-    ])
-    return phi_0
-'''
 
 def ricker_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
     # Get the exact component lengths from your utility
@@ -119,4 +69,40 @@ def ricker_IC(Nx,Ny,Nz,dx,dy,dz,xmin,xmax,ymin,ymax,zmin,zmax):
     phi_0[0:N_vx] = v0x_flat
     
     # All other components (v_y, v_z, and all stresses) remain 0
+    return phi_0
+
+
+def ricker_IC_vz(Nx, Ny, Nz, dx, dy, dz, xmin, xmax, ymin, ymax, zmin, zmax):
+    # Get the exact component lengths from your utility
+    (N_main, N_vx, N_vy, N_vz, N_sxy, N_sxz, N_syz, 
+     N_vel, N_stress, psi_len) = get_grid_size(Nx, Ny, Nz)
+
+    f0 = 1.0
+    x0, y0, z0 = 0, 0, 0.5*zmin # this assumes zmin is negative
+    
+    # Create the staggered coordinates for v_z: (Nz-1, Ny, Nx)
+    # The half-grid shift is now applied to z_vz
+    x_vz = np.linspace(xmin, xmax, Nx)
+    y_vz = np.linspace(ymin, ymax, Ny)
+    z_vz = np.linspace(zmin + dz/2, zmax - dz/2, Nz - 1)
+    
+    # Use 'ij' indexing with the order (Z, Y, X) to match (Nz-1, Ny, Nx)
+    Z_vz, Y_vz, X_vz = np.meshgrid(z_vz, y_vz, x_vz, indexing='ij')
+
+    # Compute Ricker on the staggered v_z grid, negative since we want velocities pointing up
+    ricker_vz = - Ricker(f0, X_vz, Y_vz, Z_vz, x0, y0, z0)
+    v0z_flat = np.round(ricker_vz, 20).flatten()
+
+    # Initialize the full state vector
+    phi_0 = np.zeros(psi_len)
+
+    # State vector order: [v_x, v_y, v_z, σ_xx, ...]
+    # We must skip over v_x and v_y to insert v_z
+    start_idx = N_vx + N_vy
+    end_idx = start_idx + N_vz
+
+    # Insert v_z into the correct slot
+    phi_0[start_idx:end_idx] = v0z_flat
+    
+    # All other components remain 0
     return phi_0
