@@ -105,8 +105,8 @@ def increment_gate(n_qubits: int, *, label: str = "INC") -> Gate:
     ``O(n)`` controlled-X gates (Sunderhauf Sec. 3.2, circulant remark).
     """
     circuit = QuantumCircuit(n_qubits, name=label)
-    # Flip qubit t when all lower bits are 1.
-    for target in range(n_qubits):
+    # Flip qubit t when all lower bits are 1 (high-to-low ripple carry).
+    for target in reversed(range(n_qubits)):
         controls = list(range(target))
         if controls:
             circuit.mcx(controls, target)
@@ -119,7 +119,7 @@ def decrement_gate(n_qubits: int, *, label: str = "DEC") -> Gate:
     """Modular binary decrement ``S_- = S_+^dagger`` on ``n_qubits``."""
     circuit = QuantumCircuit(n_qubits, name=label)
     inc = QuantumCircuit(n_qubits)
-    for target in range(n_qubits):
+    for target in reversed(range(n_qubits)):
         controls = list(range(target))
         if controls:
             inc.mcx(controls, target)
@@ -599,19 +599,86 @@ def clinic_elastic_stiffness_1d(
     return matrix, stiffness
 
 
+def _shift_oracle_circuit(
+    n_qubits: int,
+    n_grid: int,
+    delta: int,
+    *,
+    use_adders: bool,
+) -> QuantumCircuit:
+    """Standalone ``S_delta`` on the index register (no LCU ancillas)."""
+    circuit = QuantumCircuit(n_qubits, name=f"S_delta_{delta:+d}")
+    shift = shift_gate(n_qubits, n_grid, delta, use_adders=use_adders)
+    if isinstance(shift, Gate):
+        circuit.append(shift, circuit.qubits)
+    else:
+        circuit.append(
+            UnitaryGate(shift, check_input=False),
+            circuit.qubits,
+        )
+    return circuit
+
+
+def _shift_oracle_metrics(
+    circuit: QuantumCircuit,
+    *,
+    optimization_level: int = 3,
+) -> dict[str, int]:
+    """Transpiled T-count and CNOT count for a standalone shift oracle."""
+    metrics = transpiled_gate_counts(circuit, optimization_level=optimization_level)
+    return {
+        "t_gates": int(metrics["t_gates"]),
+        "cnot_gates": int(metrics["ops"].get("cx", 0)),
+        "two_qubit_gates": int(metrics["two_qubit_gates"]),
+        "depth": int(metrics["depth"]),
+    }
+
+
+def compare_shift_oracle_only(
+    n_grid: int,
+    *,
+    optimization_level: int = 3,
+) -> dict[str, int]:
+    """
+    T- and CNOT-gate counts for isolated cyclic shifts ``S_+`` / ``S_-``.
+
+    Compares ``increment_gate`` / ``decrement_gate`` against dense
+    ``UnitaryGate(permutation_unitary(...))`` **without** the full LCU wrapper
+    (which previously densified both paths inside SELECT).
+    """
+    n_qubits = _log2_grid_qubits(n_grid)
+    metrics = _shift_oracle_metrics
+    dense_plus = _shift_oracle_circuit(n_qubits, n_grid, 1, use_adders=False)
+    adder_plus = _shift_oracle_circuit(n_qubits, n_grid, 1, use_adders=True)
+    dense_minus = _shift_oracle_circuit(n_qubits, n_grid, -1, use_adders=False)
+    adder_minus = _shift_oracle_circuit(n_qubits, n_grid, -1, use_adders=True)
+    dense_plus_m = metrics(dense_plus, optimization_level=optimization_level)
+    adder_plus_m = metrics(adder_plus, optimization_level=optimization_level)
+    dense_minus_m = metrics(dense_minus, optimization_level=optimization_level)
+    adder_minus_m = metrics(adder_minus, optimization_level=optimization_level)
+    return {
+        "dense_S_plus_t_gates": dense_plus_m["t_gates"],
+        "adder_S_plus_t_gates": adder_plus_m["t_gates"],
+        "dense_S_plus_cnot_gates": dense_plus_m["cnot_gates"],
+        "adder_S_plus_cnot_gates": adder_plus_m["cnot_gates"],
+        "dense_S_minus_t_gates": dense_minus_m["t_gates"],
+        "adder_S_minus_t_gates": adder_minus_m["t_gates"],
+        "dense_S_minus_cnot_gates": dense_minus_m["cnot_gates"],
+        "adder_S_minus_cnot_gates": adder_minus_m["cnot_gates"],
+    }
+
+
 def compare_shift_implementations(n_grid: int) -> dict[str, int]:
     """
-    Transpiled two-qubit gate counts: dense ``UnitaryGate`` shifts vs modular adders.
+    T-gate counts for the **full** periodic LCU circuit (dense vs adder shifts).
 
-    Both implement the same ``S_±``; this compares **circuit structure** cost.
-    At small ``N`` the transpiler may fold them to similar counts — the adder path
-    is the scalable one for large grids.
+    For a fair shift-oracle comparison, use ``compare_shift_oracle_only``.
     """
     dense, _, _ = build_laplacian_block_encoding_circuit(n_grid, use_adders=False)
     adder, _, _ = build_laplacian_block_encoding_circuit(n_grid, use_adders=True)
     return {
-        "dense_two_qubit_gates": transpiled_gate_counts(dense)["two_qubit_gates"],
-        "adder_two_qubit_gates": transpiled_gate_counts(adder)["two_qubit_gates"],
+        "dense_t_gates": transpiled_gate_counts(dense)["t_gates"],
+        "adder_t_gates": transpiled_gate_counts(adder)["t_gates"],
     }
 
 
