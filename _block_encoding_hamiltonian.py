@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time as time_mod
 
 import numpy as np
 import pandas as pd
@@ -793,6 +794,236 @@ def verify_staggered_index_oracles(
     }
 
 
+def _classical_bits_apply_controlled_xor(
+    bits: list[int],
+    controls: list[int],
+    ctrl_state: int,
+    targets: list[int],
+    value: int,
+) -> None:
+    """In-place classical action of :func:`_append_controlled_xor_constant`."""
+    if value == 0 or not targets:
+        return
+    matched = True
+    for i, qubit in enumerate(controls):
+        if bits[qubit] != ((ctrl_state >> i) & 1):
+            matched = False
+            break
+    if not matched:
+        return
+    for bit, target in enumerate(targets):
+        if (value >> bit) & 1:
+            bits[target] ^= 1
+
+
+def _bits_to_int(bits: list[int]) -> int:
+    value = 0
+    for i, bit in enumerate(bits):
+        if bit:
+            value |= 1 << i
+    return value
+
+
+def verify_circuit_index_oracles(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    spot_checks: int = 8,
+    rng_seed: int = 0,
+    max_sv_lookup_qubits: int = 14,
+) -> dict[str, object]:
+    """
+    Check real MCX index oracles against ``(d,m)->(i,j)`` maps.
+
+    Validates gate counts (one MCX per set bit of each XOR constant) and
+    spot-checks labels by **classical bit-level** simulation of the same
+    controlled-XOR MCXs (no ``2^{n_lookup}`` statevector). Optional Qiskit SV
+    spot-checks run only when ``n_lookup <= max_sv_lookup_qubits``.
+    """
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    dim_idx = 2 ** (n_d + n_m + n_idx)
+    dim_dm = 2 ** (n_d + n_m)
+    lookup_qubits = n_d + n_m + n_idx
+    controls = list(range(n_d + n_m))
+    targets = list(range(n_d + n_m, n_d + n_m + n_idx))
+
+    oc_circ = build_column_oracle_circuit(oracle)
+    or_circ = build_row_oracle_circuit(oracle)
+    ot_circ = build_transpose_oracle_circuit(oracle)
+    expect_oc = sum(int(col).bit_count() for _, (_, col, _) in oracle.entries_by_dm.items())
+    expect_or = sum(
+        (int(row) ^ int(col)).bit_count()
+        for _, (row, col, _) in oracle.entries_by_dm.items()
+    )
+    expect_ot = len(oracle.base.d_to_value) if n_m > 0 else 0
+    struct_ok = (
+        oc_circ.size() == expect_oc
+        and or_circ.size() == expect_or
+        and ot_circ.size() == expect_ot
+    )
+
+    def _bit_oc(d_label: int, m_label: int, col: int) -> int:
+        bits = (
+            _index_bits(d_label, n_d)
+            + _index_bits(m_label, n_m)
+            + _index_bits(0, n_idx)
+        )
+        _classical_bits_apply_controlled_xor(
+            bits, controls, _dm_ctrl_state(d_label, m_label, n_d), targets, int(col)
+        )
+        return _bits_to_int(bits[n_d + n_m :])
+
+    def _bit_or(d_label: int, m_label: int, row: int, col: int) -> int:
+        bits = (
+            _index_bits(d_label, n_d)
+            + _index_bits(m_label, n_m)
+            + _index_bits(col, n_idx)
+        )
+        _classical_bits_apply_controlled_xor(
+            bits,
+            controls,
+            _dm_ctrl_state(d_label, m_label, n_d),
+            targets,
+            int(row) ^ int(col),
+        )
+        return _bits_to_int(bits[n_d + n_m :])
+
+    def _bit_ot(d_label: int, m_label: int) -> int:
+        bits = _index_bits(d_label, n_d) + _index_bits(m_label, n_m)
+        if n_m == 0:
+            return int(m_label)
+        # Same as build_transpose_oracle_circuit: flip high m bit controlled on d.
+        m_high = n_d + n_m - 1
+        if n_d == 0:
+            bits[m_high] ^= 1
+        else:
+            matched = all(
+                bits[i] == ((int(d_label) >> i) & 1) for i in range(n_d)
+            )
+            if matched:
+                bits[m_high] ^= 1
+        return _bits_to_int(bits[n_d:])
+
+    def _sv_oc(d_label: int, m_label: int, col: int) -> int:
+        qc = QuantumCircuit(n_d + n_m + n_idx)
+        _append_controlled_xor_constant(
+            qc, controls, _dm_ctrl_state(d_label, m_label, n_d), targets, int(col)
+        )
+        start = _basis_index(
+            [_index_bits(d_label, n_d), _index_bits(m_label, n_m), _index_bits(0, n_idx)]
+        )
+        psi = np.zeros(dim_idx, dtype=complex)
+        psi[start] = 1.0
+        return int(np.argmax(np.abs(Statevector(psi).evolve(qc).data)))
+
+    def _sv_or(d_label: int, m_label: int, row: int, col: int) -> int:
+        qc = QuantumCircuit(n_d + n_m + n_idx)
+        _append_controlled_xor_constant(
+            qc,
+            controls,
+            _dm_ctrl_state(d_label, m_label, n_d),
+            targets,
+            int(row) ^ int(col),
+        )
+        start = _basis_index(
+            [
+                _index_bits(d_label, n_d),
+                _index_bits(m_label, n_m),
+                _index_bits(col, n_idx),
+            ]
+        )
+        psi = np.zeros(dim_idx, dtype=complex)
+        psi[start] = 1.0
+        return int(np.argmax(np.abs(Statevector(psi).evolve(qc).data)))
+
+    def _sv_ot(d_label: int, m_label: int) -> int:
+        qc = QuantumCircuit(n_d + n_m)
+        if n_m == 0:
+            return _basis_index([_index_bits(d_label, n_d), _index_bits(m_label, n_m)])
+        if n_d == 0:
+            qc.x(n_m - 1)
+        else:
+            qc.mcx(list(range(n_d)), n_d + n_m - 1, ctrl_state=int(d_label))
+        start = _basis_index(
+            [_index_bits(d_label, n_d), _index_bits(m_label, n_m)]
+        )
+        psi = np.zeros(dim_dm, dtype=complex)
+        psi[start] = 1.0
+        return int(np.argmax(np.abs(Statevector(psi).evolve(qc).data)))
+
+    bit_errors = 0
+    sv_errors = 0
+    use_sv = lookup_qubits <= max_sv_lookup_qubits
+    items = list(oracle.entries_by_dm.items())
+    rng = np.random.default_rng(rng_seed)
+    if items and spot_checks > 0:
+        picks = rng.choice(len(items), size=min(spot_checks, len(items)), replace=False)
+        for idx in picks:
+            (d_label, m_label), (row, col, _) = items[int(idx)]
+            if _bit_oc(d_label, m_label, col) != int(col):
+                bit_errors += 1
+            if _bit_or(d_label, m_label, row, col) != int(row):
+                bit_errors += 1
+            if n_m > 0 and _bit_ot(d_label, m_label) != (
+                int(m_label) ^ (1 << (n_m - 1))
+            ):
+                bit_errors += 1
+
+            if use_sv:
+                expect_c = _basis_index(
+                    [
+                        _index_bits(d_label, n_d),
+                        _index_bits(m_label, n_m),
+                        _index_bits(col, n_idx),
+                    ]
+                )
+                expect_r = _basis_index(
+                    [
+                        _index_bits(d_label, n_d),
+                        _index_bits(m_label, n_m),
+                        _index_bits(row, n_idx),
+                    ]
+                )
+                if _sv_oc(d_label, m_label, col) != expect_c:
+                    sv_errors += 1
+                if _sv_or(d_label, m_label, row, col) != expect_r:
+                    sv_errors += 1
+                if n_m > 0:
+                    out_m = m_label ^ (1 << (n_m - 1))
+                    m_expect = _basis_index(
+                        [_index_bits(d_label, n_d), _index_bits(out_m, n_m)]
+                    )
+                    if _sv_ot(d_label, m_label) != m_expect:
+                        sv_errors += 1
+
+    # Full nnz chain on bit semantics (still O(nnz), not O(2^{n_lookup})).
+    chain_errors = 0
+    for (d_label, m_label), (row, col, _) in oracle.entries_by_dm.items():
+        if _bit_oc(d_label, m_label, col) != int(col):
+            chain_errors += 1
+        if _bit_or(d_label, m_label, row, col) != int(row):
+            chain_errors += 1
+
+    return {
+        "structure_ok": struct_ok,
+        "oc_size": oc_circ.size(),
+        "or_size": or_circ.size(),
+        "ot_size": ot_circ.size(),
+        "expect_oc_size": expect_oc,
+        "expect_or_size": expect_or,
+        "expect_ot_size": expect_ot,
+        "bit_spot_errors": bit_errors,
+        "bit_chain_errors": chain_errors,
+        "statevector_spot_errors": sv_errors,
+        "statevector_spot_checks_used": use_sv,
+        "lookup_dim": dim_idx,
+        "dm_dim": dim_dm,
+        "ok": struct_ok
+        and bit_errors == 0
+        and chain_errors == 0
+        and sv_errors == 0,
+    }
+
+
 def _make_permutation_unitary(
     mapping: dict[int, int],
     dim: int,
@@ -820,50 +1051,167 @@ def _make_permutation_unitary(
     return UnitaryGate(operator, check_input=False, label=label)
 
 
+def _append_controlled_xor_constant(
+    circuit: QuantumCircuit,
+    controls: list[int],
+    ctrl_state: int,
+    targets: list[int],
+    value: int,
+) -> None:
+    """
+    Controlled XOR of a classical constant into ``targets``.
+
+    For each bit of ``value`` that is 1, applies an MCX with the given control
+    pattern. Self-inverse; implements ``|c>|x> -> |c>|x ⊕ value>`` on the
+    control subspace.
+    """
+    if value == 0 or not targets:
+        return
+    for bit, target in enumerate(targets):
+        if (value >> bit) & 1:
+            if controls:
+                circuit.mcx(controls, target, ctrl_state=ctrl_state)
+            else:
+                circuit.x(target)
+
+
+def _dm_ctrl_state(d_label: int, m_label: int, n_d: int) -> int:
+    """Pack ``(d, m)`` into a Qiskit ``ctrl_state`` (LSB = first control)."""
+    return int(d_label) | (int(m_label) << n_d)
+
+
+def build_column_oracle_circuit(oracle: HamiltonianOracleLabeling) -> QuantumCircuit:
+    """
+    Real ``O_c`` circuit: ``|d>|m>|0> -> |d>|m>|j>`` via controlled XOR of ``j``.
+
+    Memory-efficient (no dense ``2^{n_d+n_m+n_idx}`` matrix). Self-inverse.
+    """
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    circuit = QuantumCircuit(n_d + n_m + n_idx, name="O_c")
+    controls = list(range(n_d + n_m))
+    targets = list(range(n_d + n_m, n_d + n_m + n_idx))
+    for (d_label, m_label), (_, col, _) in oracle.entries_by_dm.items():
+        _append_controlled_xor_constant(
+            circuit,
+            controls,
+            _dm_ctrl_state(d_label, m_label, n_d),
+            targets,
+            int(col),
+        )
+    return circuit
+
+
+def build_row_oracle_circuit(oracle: HamiltonianOracleLabeling) -> QuantumCircuit:
+    """
+    Real ``O_r`` circuit: ``|d>|m>|j> -> |d>|m>|i>`` via controlled XOR of ``i⊕j``.
+
+    On each ``(d,m)`` subspace this is translation by ``i⊕j``, hence unitary;
+    it sends the physical column index ``j`` to the row index ``i``.
+    """
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    circuit = QuantumCircuit(n_d + n_m + n_idx, name="O_r")
+    controls = list(range(n_d + n_m))
+    targets = list(range(n_d + n_m, n_d + n_m + n_idx))
+    for (d_label, m_label), (row, col, _) in oracle.entries_by_dm.items():
+        _append_controlled_xor_constant(
+            circuit,
+            controls,
+            _dm_ctrl_state(d_label, m_label, n_d),
+            targets,
+            int(row) ^ int(col),
+        )
+    return circuit
+
+
+def build_transpose_oracle_circuit(oracle: HamiltonianOracleLabeling) -> QuantumCircuit:
+    """
+    Real ``O_t``: flip the high ``m`` bit for each active coefficient label ``d``.
+
+    Clinic elastic ``H`` has only off-diagonal ``v <-> sigma`` sections, so the
+    Hermitian partner is the other multiplicity slot within the section.
+    """
+    n_d, n_m = oracle.n_d_qubits, oracle.n_m_qubits
+    circuit = QuantumCircuit(n_d + n_m, name="O_t")
+    if n_m == 0:
+        return circuit
+    d_controls = list(range(n_d))
+    m_high = n_d + n_m - 1
+    for d_label in oracle.base.d_to_value:
+        if n_d == 0:
+            circuit.x(m_high)
+        else:
+            circuit.mcx(d_controls, m_high, ctrl_state=int(d_label))
+    return circuit
+
+
+def _normalize_lookup_mode(materialize: bool | str) -> str:
+    """Map legacy ``materialize`` flags to ``opaque`` | ``circuit`` | ``dense``."""
+    if isinstance(materialize, str):
+        mode = materialize.lower()
+        if mode not in {"opaque", "circuit", "dense"}:
+            raise ValueError("lookup mode must be 'opaque', 'circuit', or 'dense'.")
+        return mode
+    return "dense" if materialize else "opaque"
+
+
 def _lookup_gate_from_map(
     mapping: dict[int, int],
     dim: int,
     *,
     label: str,
-    materialize: bool,
+    materialize: bool | str,
 ) -> Gate:
-    """Opaque oracle gate, optionally backed by a dense ``UnitaryGate``."""
+    """Opaque or dense-``UnitaryGate`` oracle from a completed permutation map."""
     n_qubits = int(np.log2(dim))
-    if not materialize:
+    mode = _normalize_lookup_mode(materialize)
+    if mode == "opaque":
         return Gate(label, n_qubits, [])
-    return _make_permutation_unitary(mapping, dim, label=label)
+    if mode == "dense":
+        return _make_permutation_unitary(mapping, dim, label=label)
+    raise ValueError(f"mode {mode!r} is not valid for map-based lookup; use circuit builders.")
 
 
 def build_column_oracle_lookup(
     oracle: HamiltonianOracleLabeling,
     *,
-    materialize: bool = False,
+    materialize: bool | str = False,
 ) -> Gate:
-    """Lookup ``O_c``: ``|d>|m>|0> -> |d>|m>|j>`` on the padded index register."""
+    """
+    Lookup ``O_c``: ``|d>|m>|0> -> |d>|m>|j>``.
+
+    ``materialize``: ``False``/``\"opaque\"`` placeholder; ``\"circuit\"`` real MCX
+    loads; ``True``/``\"dense\"`` full unitary (tiny registers only).
+    """
+    mode = _normalize_lookup_mode(materialize)
+    if mode == "circuit":
+        return build_column_oracle_circuit(oracle).to_gate(label="O_c")
     n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
     dim = 2 ** (n_d + n_m + n_idx)
     return _lookup_gate_from_map(
-        build_column_oracle_map(oracle), dim, label="O_c", materialize=materialize
+        build_column_oracle_map(oracle), dim, label="O_c", materialize=mode
     )
 
 
 def build_row_oracle_lookup(
     oracle: HamiltonianOracleLabeling,
     *,
-    materialize: bool = False,
+    materialize: bool | str = False,
 ) -> Gate:
-    """Lookup ``O_r``: ``|d>|m>|j> -> |d>|m>|i>``."""
+    """Lookup ``O_r``: ``|d>|m>|j> -> |d>|m>|i>`` (see ``build_column_oracle_lookup``)."""
+    mode = _normalize_lookup_mode(materialize)
+    if mode == "circuit":
+        return build_row_oracle_circuit(oracle).to_gate(label="O_r")
     n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
     dim = 2 ** (n_d + n_m + n_idx)
     return _lookup_gate_from_map(
-        build_row_oracle_map(oracle), dim, label="O_r", materialize=materialize
+        build_row_oracle_map(oracle), dim, label="O_r", materialize=mode
     )
 
 
 def build_transpose_oracle_hamiltonian(
     oracle: HamiltonianOracleLabeling,
     *,
-    materialize: bool = False,
+    materialize: bool | str = False,
 ) -> Gate:
     """
     Pechan / Sünderhauf ``O_t`` on ``|d>|m>``.
@@ -872,6 +1220,10 @@ def build_transpose_oracle_hamiltonian(
     couplings), so active labels flip the high ``m`` bit to access Hermitian
     partners within each block section.
     """
+    mode = _normalize_lookup_mode(materialize)
+    if mode == "circuit":
+        return build_transpose_oracle_circuit(oracle).to_gate(label="O_t")
+
     n_d = oracle.n_d_qubits
     n_m = oracle.n_m_qubits
     dim = 2 ** (n_d + n_m)
@@ -893,7 +1245,7 @@ def build_transpose_oracle_hamiltonian(
             )
             permutation[in_index] = out_index
 
-    if not materialize:
+    if mode == "opaque":
         return Gate("O_t", n_d + n_m, [])
     return _make_permutation_unitary(permutation, dim, label="O_t")
 
@@ -902,7 +1254,7 @@ def build_hamiltonian_block_encoding_circuit(
     oracle: HamiltonianOracleLabeling,
     *,
     scale: float | None = None,
-    materialize_lookup: bool = False,
+    materialize_lookup: bool | str = "circuit",
 ) -> tuple[QuantumCircuit, float]:
     """
     Assembled elastic block-encoding circuit ``U_H`` (Pechan / Sünderhauf).
@@ -910,25 +1262,27 @@ def build_hamiltonian_block_encoding_circuit(
     Register layout: ``data | d | m | idx`` (same as Laplacian ``U_G``).
 
     Loads ``Im(H)`` magnitudes on the data qubit (clinic ``H`` is purely
-    imaginary Hermitian) and applies lookup index oracles ``O_c, O_r, O_t``.
+    imaginary Hermitian) and applies index oracles ``O_c, O_r, O_t``.
 
-    By default index oracles are **opaque gates** (fast to build). Set
-    ``materialize_lookup=True`` only when the combined ``(d,m,idx)`` register is
-    small enough for dense ``UnitaryGate`` synthesis.
+    ``materialize_lookup``:
+      - ``\"circuit\"`` (default) — real controlled-XOR / MCX index oracles;
+      - ``\"opaque\"`` / ``False`` — placeholder gates (fast draw / scaling);
+      - ``\"dense\"`` / ``True`` — dense ``UnitaryGate`` (tiny registers only).
     """
     target = oracle.matrix.imag
     alpha = scale if scale is not None else spectral_scale(target)
     if alpha < 1e-15:
         alpha = 1.0
     payload = imag_payload(oracle.base)
+    mode = _normalize_lookup_mode(materialize_lookup)
 
     n_d = oracle.n_d_qubits
     n_m = oracle.n_m_qubits
     n_idx = oracle.n_index_qubits
 
-    oc = build_column_oracle_lookup(oracle, materialize=materialize_lookup)
-    or_gate = build_row_oracle_lookup(oracle, materialize=materialize_lookup)
-    ot = build_transpose_oracle_hamiltonian(oracle, materialize=materialize_lookup)
+    oc = build_column_oracle_lookup(oracle, materialize=mode)
+    or_gate = build_row_oracle_lookup(oracle, materialize=mode)
+    ot = build_transpose_oracle_hamiltonian(oracle, materialize=mode)
 
     circuit = QuantumCircuit(oracle.num_qubits_uh, name="U_H")
     data = 0
@@ -936,11 +1290,12 @@ def build_hamiltonian_block_encoding_circuit(
     m_regs = list(range(1 + n_d, 1 + n_d + n_m))
     idx_regs = list(range(1 + n_d + n_m, circuit.num_qubits))
 
-    if materialize_lookup:
-        circuit.append(oc.inverse(), d_regs + m_regs + idx_regs)
-    else:
+    # Controlled-XOR O_c is self-inverse; dense UnitaryGate uses .inverse().
+    if mode == "opaque":
         oc_inv = Gate("O_c_inv", len(d_regs + m_regs + idx_regs), [])
         circuit.append(oc_inv, d_regs + m_regs + idx_regs)
+    else:
+        circuit.append(oc.inverse(), d_regs + m_regs + idx_regs)
     apply_multiplexed_ry(circuit, data, d_regs, payload, alpha)
     circuit.z(data)
     circuit.append(ot, d_regs + m_regs)
@@ -978,7 +1333,7 @@ def hamiltonian_gate_budget_report(
     oracle: HamiltonianOracleLabeling,
     *,
     transpile_uh: bool = False,
-    materialize_lookup: bool = False,
+    materialize_lookup: bool | str = False,
     sk_t_count: bool = False,
     optimization_level: int = 2,
 ) -> dict[str, object]:
@@ -986,7 +1341,7 @@ def hamiltonian_gate_budget_report(
     Gate budget for elastic ``U_H``.
 
     By default transpiles only ``O_data`` (fast). Set ``transpile_uh=True`` on
-    tiny grids for full ``U_H`` T-counts (slow: dense lookup oracles).
+    tiny grids for full ``U_H`` T-counts (slow).
     """
     odata_budget = hamiltonian_odata_gate_budget(
         oracle,
@@ -1034,18 +1389,168 @@ def hamiltonian_gate_budget_report(
     return report
 
 
+def _dense_unitary_gb(dim: int, *, bytes_per_complex: int = 16) -> float:
+    """GB for a dense ``dim x dim`` complex matrix (default complex128; 1024^3 bytes)."""
+    return float(dim) * float(dim) * float(bytes_per_complex) / (1024.0**3)
+
+
+def summarize_uh_register_footprint(
+    grid_sizes: tuple[tuple[int, int, int], ...] = ((2, 2, 2), (4, 2, 2), (4, 4, 2)),
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    bytes_per_complex: int = 16,
+    dense_lookup_budget_gb: float = 1.0,
+) -> pd.DataFrame:
+    """
+    Register / memory footprint for Pechan ``U_H`` without dense lookup synthesis.
+
+    Motivates the ``2x2x2`` demo grid in Sections 7–11: opaque oracles and
+    content checks stay cheap, but materializing ``O_c`` / ``O_r`` or the full
+    ``U_H`` unitary grows as ``2^{n_d+n_m+n_idx}`` / ``2^{n_qubits_uh}``.
+    """
+    bcs = {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"}
+    rows: list[dict[str, object]] = []
+    for nx, ny, nz in grid_sizes:
+        rho, compliance, _ = clinic_elastic_materials(
+            nx, ny, nz, add_fractures=add_fractures
+        )
+        hamiltonian, *_ = FD_solver_3D_elastic(
+            nx, ny, nz, dx, dx, dx, rho, compliance, bcs
+        )
+        layout = elastic_3d_layout(nx, ny, nz)
+        labeling = label_coefficients_by_block(hamiltonian, layout, matrix_name="H")
+        oracle = build_hamiltonian_oracle_labeling(labeling, hamiltonian)
+        lookup_qubits = oracle.n_d_qubits + oracle.n_m_qubits + oracle.n_index_qubits
+        lookup_dim = 2**lookup_qubits
+        uh_dim = 2**oracle.num_qubits_uh
+        system_dim = oracle.n_index_padded
+        dense_oc_gb = _dense_unitary_gb(lookup_dim, bytes_per_complex=bytes_per_complex)
+        dense_uh_gb = _dense_unitary_gb(uh_dim, bytes_per_complex=bytes_per_complex)
+        dense_expm_gb = _dense_unitary_gb(system_dim, bytes_per_complex=bytes_per_complex)
+        rows.append(
+            {
+                "nx": nx,
+                "ny": ny,
+                "nz": nz,
+                "fractures": add_fractures,
+                "N_s": layout.n_total,
+                "D_prime": labeling.d_prime,
+                "n_d": oracle.n_d_qubits,
+                "n_m": oracle.n_m_qubits,
+                "n_idx": oracle.n_index_qubits,
+                "n_qubits_uh": oracle.num_qubits_uh,
+                "n_system": int(np.log2(system_dim)),
+                "lookup_dim": lookup_dim,
+                "uh_dim": uh_dim,
+                "system_dim": system_dim,
+                "dense_Oc_GB": dense_oc_gb,
+                "dense_UH_GB": dense_uh_gb,
+                "dense_expm_GB": dense_expm_gb,
+                "dense_lookup_ok": dense_oc_gb <= dense_lookup_budget_gb,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def summarize_sparse_circuit_scaling(
+    grid_sizes: tuple[tuple[int, int, int], ...] = ((2, 2, 2), (4, 2, 2), (4, 4, 2)),
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    decompose_reps: int = 1,
+    reference_sv_seconds: float | None = 11.0,
+) -> pd.DataFrame:
+    """
+    Real MCX / sparse-circuit cost vs grid (why Sections 7–11 stay on ``2x2x2``).
+
+    Dense ``UnitaryGate`` RAM is a separate story (see
+    ``summarize_uh_register_footprint``). Here the bottleneck is classical
+    simulation of the *built* circuits: full ``Statevector`` evolution of
+    ``O_c`` scales roughly like ``(MCX gates) x 2^{n_lookup}``. On a laptop,
+    ``2x2x2`` is interactive (~10 s for a full ``O_c`` SV); ``4x2x2`` and
+    larger stall for many minutes / hours.
+
+    ``reference_sv_seconds`` calibrates extrapolated SV times from a measured
+    ``2x2x2`` full-``O_c`` statevector run (set ``None`` to skip the estimate).
+    """
+    bcs = {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"}
+    rows: list[dict[str, object]] = []
+    ref_work: float | None = None
+    for nx, ny, nz in grid_sizes:
+        rho, compliance, _ = clinic_elastic_materials(
+            nx, ny, nz, add_fractures=add_fractures
+        )
+        hamiltonian, *_ = FD_solver_3D_elastic(
+            nx, ny, nz, dx, dx, dx, rho, compliance, bcs
+        )
+        layout = elastic_3d_layout(nx, ny, nz)
+        labeling = label_coefficients_by_block(hamiltonian, layout, matrix_name="H")
+        oracle = build_hamiltonian_oracle_labeling(labeling, hamiltonian)
+        oc = build_column_oracle_circuit(oracle)
+        or_circ = build_row_oracle_circuit(oracle)
+        ot = build_transpose_oracle_circuit(oracle)
+        uh, _ = build_hamiltonian_block_encoding_circuit(
+            oracle, materialize_lookup="circuit"
+        )
+        uh_dec = uh.decompose(reps=decompose_reps)
+        lookup_qubits = oracle.n_d_qubits + oracle.n_m_qubits + oracle.n_index_qubits
+        lookup_dim = 2**lookup_qubits
+        # Rough classical cost for evolving the full O_c circuit on |0...0>.
+        oc_sv_work = float(oc.size()) * float(lookup_dim)
+        uh_sv_work = float(uh_dec.size()) * float(2**oracle.num_qubits_uh)
+        if ref_work is None:
+            ref_work = oc_sv_work
+        est_oc_sv_s = (
+            None
+            if reference_sv_seconds is None or ref_work is None or ref_work <= 0
+            else float(reference_sv_seconds) * (oc_sv_work / ref_work)
+        )
+        rows.append(
+            {
+                "nx": nx,
+                "ny": ny,
+                "nz": nz,
+                "fractures": add_fractures,
+                "N_s": layout.n_total,
+                "nnz": len(oracle.entries_by_dm),
+                "n_d": oracle.n_d_qubits,
+                "n_m": oracle.n_m_qubits,
+                "n_idx": oracle.n_index_qubits,
+                "n_lookup": lookup_qubits,
+                "n_qubits_uh": oracle.num_qubits_uh,
+                "lookup_dim": lookup_dim,
+                "uh_dim": 2**oracle.num_qubits_uh,
+                "O_c_size": oc.size(),
+                "O_r_size": or_circ.size(),
+                "O_t_size": ot.size(),
+                "U_H_size": uh.size(),
+                "U_H_size_decomposed": uh_dec.size(),
+                "U_H_depth_decomposed": uh_dec.depth(),
+                "O_c_sv_work": oc_sv_work,
+                "U_H_sv_work": uh_sv_work,
+                "est_O_c_sv_seconds": est_oc_sv_s,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def summarize_uh_gate_scaling(
     grid_sizes: tuple[tuple[int, int, int], ...] = ((2, 2, 2), (4, 2, 2), (4, 4, 2)),
     *,
     add_fractures: bool = True,
     dx: float = 0.05,
     sk_t_count: bool = False,
+    materialize_lookup: str = "circuit",
+    decompose_reps: int = 1,
 ) -> pd.DataFrame:
     """
     Gate / depth table vs clinic DOF count ``N_s`` for elastic ``U_H``.
 
     Always reports transpiled ``O_data`` metrics and untranspiled ``U_H``
-    depth/size from the assembled circuit (opaque lookup gates by default).
+    depth/size from the assembled circuit. With ``materialize_lookup="circuit"``
+    (default), also reports ``U_H_size_decomposed`` after one decomposition
+    pass (real MCX index oracles exposed).
     """
     bcs = {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"}
     rows: list[dict[str, object]] = []
@@ -1060,7 +1565,10 @@ def summarize_uh_gate_scaling(
         labeling = label_coefficients_by_block(hamiltonian, layout, matrix_name="H")
         oracle = build_hamiltonian_oracle_labeling(labeling, hamiltonian)
         odata_budget = hamiltonian_odata_gate_budget(oracle, sk_t_count=sk_t_count)
-        circuit, alpha = build_hamiltonian_block_encoding_circuit(oracle)
+        circuit, alpha = build_hamiltonian_block_encoding_circuit(
+            oracle, materialize_lookup=materialize_lookup
+        )
+        uh_dec = circuit.decompose(reps=decompose_reps)
         rows.append(
             {
                 "nx": nx,
@@ -1076,6 +1584,8 @@ def summarize_uh_gate_scaling(
                 "O_data_t_gates": odata_budget["t_gates"],
                 "U_H_depth": circuit.depth(),
                 "U_H_size": circuit.size(),
+                "U_H_size_decomposed": uh_dec.size(),
+                "U_H_depth_decomposed": uh_dec.depth(),
             }
         )
     return pd.DataFrame(rows)
@@ -1315,6 +1825,7 @@ def evolve_with_assembled_uh(
     time: float,
     *,
     backend: str = "structured_qiskit",
+    include_pauli_baseline: bool = True,
 ) -> dict[str, object]:
     """
     Time evolution using Hamiltonian **assembled from ``U_H`` oracles**.
@@ -1325,10 +1836,21 @@ def evolve_with_assembled_uh(
         ``\"sparse\"`` — ``expm_multiply`` on oracle ``H``;
         ``\"structured_qiskit\"`` — pad + ``UnitaryGate(expm(-iHt))`` (replaces
         ``MatrixExponential`` / Pauli synthesis).
+    include_pauli_baseline:
+        If True, densify padded ``H`` into ``SparsePauliOp`` for a cost fingerprint.
     """
     h_oracle = hamiltonian_from_oracles(oracle)
     alpha = spectral_scale(h_oracle.imag if np.max(np.abs(h_oracle.real)) < 1e-12 else h_oracle)
-    stats = matrix_exponential_pauli_stats(h_oracle)
+    stats = (
+        matrix_exponential_pauli_stats(h_oracle)
+        if include_pauli_baseline
+        else {
+            "n_qubits": int(np.ceil(np.log2(max(h_oracle.shape[0], 2)))),
+            "dim": int(pad_to_power_of_two(h_oracle.shape[0])),
+            "n_pauli_terms": -1,
+            "hamiltonian_nnz": int(np.count_nonzero(np.abs(h_oracle) > 1e-12)),
+        }
+    )
 
     if backend == "sparse":
         psi_t = evolve_state_sparse(h_oracle, psi0, time)
@@ -1356,26 +1878,145 @@ def compare_evolution_to_direct(
     hamiltonian_direct: sp.spmatrix | np.ndarray,
     psi0: np.ndarray,
     time: float,
+    *,
+    include_qiskit: bool = True,
+    include_pauli_baseline: bool = True,
 ) -> dict[str, float]:
     """
     Compare oracle-assembled structured evolution vs direct sparse ``H`` evolution.
+
+    On larger grids set ``include_qiskit=False`` to skip dense ``expm`` /
+    ``UnitaryGate`` on the padded system register, and
+    ``include_pauli_baseline=False`` to skip ``SparsePauliOp.from_operator``.
     """
     h_direct = dense_matrix(hamiltonian_direct)
     psi_direct = evolve_state_sparse(h_direct, psi0, time)
-    sparse_path = evolve_with_assembled_uh(oracle, psi0, time, backend="sparse")
-    qiskit_path = evolve_with_assembled_uh(oracle, psi0, time, backend="structured_qiskit")
+    sparse_path = evolve_with_assembled_uh(
+        oracle,
+        psi0,
+        time,
+        backend="sparse",
+        include_pauli_baseline=include_pauli_baseline,
+    )
 
-    return {
+    out: dict[str, float] = {
         "time": float(time),
         "oracle_vs_direct_H": float(np.max(np.abs(sparse_path["H_oracle"] - h_direct))),
         "sparse_oracle_vs_direct_psi": float(
             np.linalg.norm(sparse_path["psi_t"] - psi_direct)
         ),
-        "qiskit_vs_direct_psi": float(np.linalg.norm(qiskit_path["psi_t"] - psi_direct)),
-        "qiskit_vs_sparse_psi": float(
-            np.linalg.norm(qiskit_path["psi_t"] - sparse_path["psi_t"])
-        ),
-        "n_qubits": float(qiskit_path["n_qubits"]),
-        "n_pauli_terms_baseline": float(qiskit_path["pauli_baseline"]["n_pauli_terms"]),
-        "hamiltonian_nnz": float(qiskit_path["pauli_baseline"]["hamiltonian_nnz"]),
+        "n_system": float(oracle.n_grid),
+        "hamiltonian_nnz": float(len(oracle.entries_by_dm)),
     }
+
+    if include_qiskit:
+        qiskit_path = evolve_with_assembled_uh(
+            oracle,
+            psi0,
+            time,
+            backend="structured_qiskit",
+            include_pauli_baseline=include_pauli_baseline,
+        )
+        out["qiskit_vs_direct_psi"] = float(
+            np.linalg.norm(qiskit_path["psi_t"] - psi_direct)
+        )
+        out["qiskit_vs_sparse_psi"] = float(
+            np.linalg.norm(qiskit_path["psi_t"] - sparse_path["psi_t"])
+        )
+        out["n_qubits"] = float(qiskit_path["n_qubits"])
+        if include_pauli_baseline:
+            out["n_pauli_terms_baseline"] = float(
+                qiskit_path["pauli_baseline"]["n_pauli_terms"]
+            )
+    elif include_pauli_baseline:
+        stats = matrix_exponential_pauli_stats(sparse_path["H_oracle"])
+        out["n_qubits"] = float(stats["n_qubits"])
+        out["n_pauli_terms_baseline"] = float(stats["n_pauli_terms"])
+    else:
+        out["n_qubits"] = float(int(np.ceil(np.log2(max(oracle.n_grid, 2)))))
+
+    return out
+
+
+def run_larger_grid_oracle_and_sparse_evolution(
+    grid_sizes: tuple[tuple[int, int, int], ...] = ((2, 2, 2), (4, 2, 2), (4, 4, 2)),
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    time: float = 1e-6,
+    spot_checks: int = 8,
+    include_qiskit: bool = False,
+    include_pauli_baseline: bool = False,
+    rng_seed: int = 0,
+) -> pd.DataFrame:
+    """
+    Larger grid oracle correctness without full SV + sparse
+    system-register evolution.
+
+    For each grid:
+      1. map / labeling checks;
+      2. real MCX ``O_c``/``O_r``/``O_t`` structure + bit-level spot checks;
+      3. ``U_H`` content (classical recon + ``O_data`` amps);
+      4. ``expm_multiply(-i H t, psi)`` on oracle-assembled ``H`` vs clinic ``H``.
+
+    Defaults skip Qiskit dense ``expm`` and Pauli baselines so ``4x4x2`` stays
+    interactive on a laptop.
+    """
+    rows: list[dict[str, object]] = []
+    rng = np.random.default_rng(rng_seed)
+    for nx, ny, nz in grid_sizes:
+        wall0 = time_mod.perf_counter()
+        demo = build_minimal_hamiltonian_demo(
+            nx, ny, nz, add_fractures=add_fractures, dx=dx
+        )
+        oracle = demo["oracle"]
+        map_chk = demo["oracle_check"]
+        circ_chk = verify_circuit_index_oracles(
+            oracle, spot_checks=spot_checks, rng_seed=rng_seed
+        )
+        content = compare_uh_to_classical(oracle)
+        n = oracle.n_grid
+        psi0 = rng.normal(size=n) + 1j * rng.normal(size=n)
+        psi0 /= np.linalg.norm(psi0)
+        evo = compare_evolution_to_direct(
+            oracle,
+            demo["H"],
+            psi0,
+            time,
+            include_qiskit=include_qiskit,
+            include_pauli_baseline=include_pauli_baseline,
+        )
+        wall = time_mod.perf_counter() - wall0
+        ok = (
+            bool(map_chk["ok"])
+            and bool(circ_chk["ok"])
+            and content["classical_recon_error"] < 1e-10
+            and content["odata_amp_error"] < 1e-10
+            and evo["oracle_vs_direct_H"] < 1e-10
+            and evo["sparse_oracle_vs_direct_psi"] < 1e-10
+        )
+        rows.append(
+            {
+                "nx": nx,
+                "ny": ny,
+                "nz": nz,
+                "N_s": n,
+                "nnz": len(oracle.entries_by_dm),
+                "n_lookup": oracle.n_d_qubits
+                + oracle.n_m_qubits
+                + oracle.n_index_qubits,
+                "n_qubits_uh": oracle.num_qubits_uh,
+                "map_ok": bool(map_chk["ok"]),
+                "circuit_ok": bool(circ_chk["ok"]),
+                "sv_spot_used": bool(circ_chk["statevector_spot_checks_used"]),
+                "O_c_size": circ_chk["oc_size"],
+                "O_r_size": circ_chk["or_size"],
+                "recon_err": content["classical_recon_error"],
+                "odata_amp_err": content["odata_amp_error"],
+                "H_err": evo["oracle_vs_direct_H"],
+                "psi_err_sparse": evo["sparse_oracle_vs_direct_psi"],
+                "wall_seconds": wall,
+                "ok": ok,
+            }
+        )
+    return pd.DataFrame(rows)
