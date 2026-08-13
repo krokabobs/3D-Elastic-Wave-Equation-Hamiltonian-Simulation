@@ -18,8 +18,13 @@ from scipy.sparse.linalg import expm_multiply
 from _block_encoding_common import (
     apply_multiplexed_ry,
     data_loading_subcircuit,
+    explicit_odata_t_count,
+    naive_unitary_cnot_lower_bound,
     pad_to_power_of_two,
     spectral_scale,
+    t_count_adder_theory,
+    t_count_controlled_rotation,
+    t_count_mcx,
     transpiled_gate_counts,
 )
 from _utility import (
@@ -599,21 +604,38 @@ def odata_budget_for_labeling(
     *,
     use_imag: bool = True,
     sk_t_count: bool = False,
+    eps: float = 1e-10,
 ) -> dict[str, object]:
-    """Transpiled ``O_data`` budget for a Hamiltonian-style value table."""
+    """Transpiled ``O_data`` budget for a Hamiltonian-style value table.
+
+    Always includes analytic ``t_odata`` / ``t_gates_explicit`` from
+    :func:`explicit_odata_t_count` (same ledger as §13; no Solovay–Kitaev).
+    Transpiled ``t_gates`` may be 0 unless ``sk_t_count=True``.
+    """
     payload = imag_payload(labeling) if use_imag else np.real(labeling.value_table)
     scale = float(np.max(np.abs(payload)))
     if scale < 1e-15:
         scale = 1.0
     # spectral-style: use max abs when matrix not attached
-    alpha = scale
     dens = reconstruct_from_labeling(labeling)
     mat = dens.imag if use_imag else dens.real
     alpha = spectral_scale(mat) if np.max(np.abs(mat)) > 0 else scale
     counts = transpiled_gate_counts(
         data_loading_subcircuit(payload, alpha), sk_t_count=sk_t_count
     )
-    return {"alpha": alpha, "payload": payload, **counts}
+    odata_t = explicit_odata_t_count(
+        labeling.d_prime, labeling.n_d_qubits, eps=eps
+    )
+    return {
+        "alpha": alpha,
+        "payload": payload,
+        "D_prime": labeling.d_prime,
+        "n_d_qubits": labeling.n_d_qubits,
+        **counts,
+        "t_odata": odata_t["t_odata"],
+        "t_gates_explicit": odata_t["t_odata"],
+        "eps": eps,
+    }
 
 
 @dataclass(frozen=True)
@@ -1255,25 +1277,28 @@ def build_hamiltonian_block_encoding_circuit(
     *,
     scale: float | None = None,
     materialize_lookup: bool | str = "circuit",
+    use_imag: bool = True,
+    name: str | None = None,
 ) -> tuple[QuantumCircuit, float]:
     """
-    Assembled elastic block-encoding circuit ``U_H`` (Pechan / Sünderhauf).
+    Assembled Pechan / Sünderhauf block-encoding circuit.
 
     Register layout: ``data | d | m | idx`` (same as Laplacian ``U_G``).
 
-    Loads ``Im(H)`` magnitudes on the data qubit (clinic ``H`` is purely
-    imaginary Hermitian) and applies index oracles ``O_c, O_r, O_t``.
+    By default loads ``Im(M)`` (clinic ``H`` / ``iA`` are purely imaginary
+    Hermitian). Set ``use_imag=False`` for real operators such as diagonal
+    ``B^{-1/2}``.
 
     ``materialize_lookup``:
       - ``\"circuit\"`` (default) — real controlled-XOR / MCX index oracles;
       - ``\"opaque\"`` / ``False`` — placeholder gates (fast draw / scaling);
       - ``\"dense\"`` / ``True`` — dense ``UnitaryGate`` (tiny registers only).
     """
-    target = oracle.matrix.imag
+    target = oracle.matrix.imag if use_imag else oracle.matrix.real
     alpha = scale if scale is not None else spectral_scale(target)
     if alpha < 1e-15:
         alpha = 1.0
-    payload = imag_payload(oracle.base)
+    payload = imag_payload(oracle.base) if use_imag else np.real(oracle.base.value_table)
     mode = _normalize_lookup_mode(materialize_lookup)
 
     n_d = oracle.n_d_qubits
@@ -1284,7 +1309,8 @@ def build_hamiltonian_block_encoding_circuit(
     or_gate = build_row_oracle_lookup(oracle, materialize=mode)
     ot = build_transpose_oracle_hamiltonian(oracle, materialize=mode)
 
-    circuit = QuantumCircuit(oracle.num_qubits_uh, name="U_H")
+    circuit_name = name if name is not None else ("U_H" if use_imag else "U_M")
+    circuit = QuantumCircuit(oracle.num_qubits_uh, name=circuit_name)
     data = 0
     d_regs = list(range(1, 1 + n_d))
     m_regs = list(range(1 + n_d, 1 + n_d + n_m))
@@ -1586,6 +1612,162 @@ def summarize_uh_gate_scaling(
                 "U_H_size": circuit.size(),
                 "U_H_size_decomposed": uh_dec.size(),
                 "U_H_depth_decomposed": uh_dec.depth(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def explicit_index_oracle_t_counts(
+    oracle: HamiltonianOracleLabeling,
+) -> dict[str, int]:
+    """
+    Analytic ``T`` for lookup ``O_c`` / ``O_r`` / ``O_t`` (no transpile, no SK).
+
+    Each set bit in a controlled-XOR constant is one MCX with
+    ``n_d + n_m`` controls (``O_t`` uses ``n_d`` controls). Uses
+    :func:`t_count_mcx`.
+    """
+    n_ctrl_dm = oracle.n_d_qubits + oracle.n_m_qubits
+    t_per_mcx_dm = t_count_mcx(n_ctrl_dm)
+    t_per_mcx_d = t_count_mcx(oracle.n_d_qubits)
+
+    n_mcx_oc = sum(int(col).bit_count() for _, (_, col, _) in oracle.entries_by_dm.items())
+    n_mcx_or = sum(
+        (int(row) ^ int(col)).bit_count()
+        for _, (row, col, _) in oracle.entries_by_dm.items()
+    )
+    n_mcx_ot = len(oracle.base.d_to_value) if oracle.n_m_qubits > 0 else 0
+
+    t_oc = n_mcx_oc * t_per_mcx_dm
+    t_or = n_mcx_or * t_per_mcx_dm
+    t_ot = n_mcx_ot * t_per_mcx_d
+    return {
+        "n_controls_dm": n_ctrl_dm,
+        "n_controls_d": oracle.n_d_qubits,
+        "t_per_mcx_dm": t_per_mcx_dm,
+        "t_per_mcx_d": t_per_mcx_d,
+        "n_mcx_oc": n_mcx_oc,
+        "n_mcx_or": n_mcx_or,
+        "n_mcx_ot": n_mcx_ot,
+        "t_oc": t_oc,
+        "t_or": t_or,
+        "t_ot": t_ot,
+        "t_index": t_oc + t_or + t_ot,
+    }
+
+
+def explicit_hamiltonian_uh_t_budget(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    eps: float = 1e-10,
+) -> dict[str, object]:
+    """
+    One-query explicit ``T`` for structured ``U_H`` (lookup index + multiplexed
+    ``O_data``). No Solovay–Kitaev; rotations use :func:`t_count_rotation`.
+    """
+    index = explicit_index_oracle_t_counts(oracle)
+    odata = explicit_odata_t_count(
+        oracle.base.d_prime, oracle.n_d_qubits, eps=eps
+    )
+    # U_H uses O_c once (as inverse; same T), O_data, Z (Clifford), O_t, O_r.
+    t_uh = int(index["t_oc"] + odata["t_odata"] + index["t_ot"] + index["t_or"])
+    t_arith_index = int(
+        2 * t_count_adder_theory(oracle.n_index_qubits)
+        + t_count_mcx(oracle.n_d_qubits) * max(oracle.base.d_prime, 0)
+    )
+    return {
+        **index,
+        **odata,
+        "eps": eps,
+        "t_uh_one_query": t_uh,
+        "t_arith_index_theory": t_arith_index,
+        # Fair scalable one-query ledger: arithmetic index oracles + same O_data.
+        "t_uh_arith_theory": int(t_arith_index + odata["t_odata"]),
+    }
+
+
+def summarize_explicit_t_vs_naive_3d(
+    grid_sizes: tuple[tuple[int, int, int], ...] = (
+        (2, 2, 2),
+        (4, 2, 2),
+        (4, 4, 2),
+        (8, 4, 2),
+    ),
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    eps: float = 1e-10,
+    max_pauli_dim: int = 64,
+) -> pd.DataFrame:
+    """
+    Explicit structured ``T`` vs naive dense / Pauli theory on 3D elastic grids.
+
+    **Current lookup BE:** MCX bit-count × :func:`t_count_mcx` + ``O_data``
+    (``t_uh_one_query``).
+
+    **Fair scalable structured BE:** arithmetic index theory + same ``O_data``
+    (``t_uh_arith_theory``). This is the contrast to use against naive dense
+    synthesis — not lookup vs ``naive_system_cnot_lb``.
+
+    **Naive baselines:**
+      * ``naive_system_cnot_lb`` — generic unitary CNOT lower bound on
+        ``n_s = ceil(log2 N_s)`` qubits (dense ``e^{-iHt}`` synthesis proxy).
+      * ``naive_uh_cnot_lb`` — same on full ``U_H`` register.
+      * ``naive_dense_uh_entries`` — ``(2^{n_uh})^2`` dense matrix entries.
+      * ``n_pauli_terms`` — clinic ``SparsePauliOp.from_operator`` count when
+        padded dim ``<= max_pauli_dim`` (else ``None``).
+    """
+    bcs = {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"}
+    rows: list[dict[str, object]] = []
+    for nx, ny, nz in grid_sizes:
+        rho, compliance, _ = clinic_elastic_materials(
+            nx, ny, nz, add_fractures=add_fractures
+        )
+        hamiltonian, *_ = FD_solver_3D_elastic(
+            nx, ny, nz, dx, dx, dx, rho, compliance, bcs
+        )
+        layout = elastic_3d_layout(nx, ny, nz)
+        labeling = label_coefficients_by_block(hamiltonian, layout, matrix_name="H")
+        oracle = build_hamiltonian_oracle_labeling(labeling, hamiltonian)
+        budget = explicit_hamiltonian_uh_t_budget(oracle, eps=eps)
+
+        n_s = int(np.ceil(np.log2(max(layout.n_total, 2))))
+        n_uh = int(oracle.num_qubits_uh)
+        dim_pad = 1 << n_s
+        n_pauli: int | None = None
+        if dim_pad <= max_pauli_dim:
+            h_dense = (
+                hamiltonian.toarray()
+                if sp.issparse(hamiltonian)
+                else np.asarray(hamiltonian)
+            )
+            n_pauli = int(matrix_exponential_pauli_stats(h_dense)["n_pauli_terms"])
+
+        rows.append(
+            {
+                "nx": nx,
+                "ny": ny,
+                "nz": nz,
+                "N_s": layout.n_total,
+                "nnz": len(oracle.entries_by_dm),
+                "D_prime": labeling.d_prime,
+                "n_s": n_s,
+                "n_lookup": oracle.n_d_qubits
+                + oracle.n_m_qubits
+                + oracle.n_index_qubits,
+                "n_uh": n_uh,
+                "n_mcx_oc": budget["n_mcx_oc"],
+                "n_mcx_or": budget["n_mcx_or"],
+                "t_index": budget["t_index"],
+                "t_odata": budget["t_odata"],
+                "t_uh_one_query": budget["t_uh_one_query"],
+                "t_arith_index_theory": budget["t_arith_index_theory"],
+                "t_uh_arith_theory": budget["t_uh_arith_theory"],
+                "naive_system_cnot_lb": naive_unitary_cnot_lower_bound(n_s),
+                "naive_uh_cnot_lb": naive_unitary_cnot_lower_bound(n_uh),
+                "naive_dense_uh_entries": int(2 ** (2 * n_uh)),
+                "n_pauli_terms": n_pauli,
+                "eps": eps,
             }
         )
     return pd.DataFrame(rows)
@@ -2020,3 +2202,1195 @@ def run_larger_grid_oracle_and_sparse_evolution(
             }
         )
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# (A) Full-3D sparse H + sparse reference  |  (B) Suzuki–Trotter vs reference
+# ---------------------------------------------------------------------------
+
+
+def build_clinic_sparse_hamiltonian(
+    nx: int,
+    ny: int,
+    nz: int,
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+) -> dict[str, object]:
+    """
+    Build sparse clinic elastic ``H`` on a (possibly full-3D) grid.
+
+    Returns ``H`` (CSR), layout, materials, and basic size stats. No dense
+    ``U_H`` / Pauli path — suitable for larger grids than §§7–11.
+    """
+    bcs = {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"}
+    rho, compliance, mask = clinic_elastic_materials(
+        nx, ny, nz, add_fractures=add_fractures
+    )
+    hamiltonian, a_matrix, _b, _bs, _bi, b_inv_sqrt = FD_solver_3D_elastic(
+        nx, ny, nz, dx, dx, dx, rho, compliance, bcs
+    )
+    layout = elastic_3d_layout(nx, ny, nz)
+    h_csr = sp.csr_matrix(hamiltonian, dtype=complex)
+    return {
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "H": h_csr,
+        "A": a_matrix,
+        "B_inv_sqrt": b_inv_sqrt,
+        "layout": layout,
+        "fracture_mask": mask,
+        "N_s": layout.n_total,
+        "nnz": int(h_csr.nnz),
+        "hermitian_err": hermitian_error(h_csr),
+    }
+
+
+def evolve_state_dense_expm(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    psi0: np.ndarray,
+    time: float,
+) -> np.ndarray:
+    """Dense ``expm(-i H t) @ psi`` — tiny-grid baseline only (MatrixExponential peer)."""
+    h = dense_matrix(hamiltonian).astype(complex)
+    psi = np.asarray(psi0, dtype=complex)
+    if psi.shape[0] != h.shape[0]:
+        raise ValueError("psi0 length must match Hamiltonian dimension.")
+    return expm(-1j * h * time) @ psi
+
+
+def spectral_norm_hermitian_sparse(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    *,
+    tol: float = 1e-4,
+) -> float:
+    """Largest ``|λ|`` of Hermitian sparse ``H`` (power / ``eigsh``)."""
+    from scipy.sparse.linalg import eigsh
+
+    h = sp.csr_matrix(hamiltonian, dtype=complex)
+    if h.shape[0] <= 64:
+        return float(np.linalg.norm(h.toarray(), ord=2))
+    vals = eigsh(h, k=1, which="LM", return_eigenvectors=False, tol=tol)
+    return float(abs(vals[0]))
+
+
+def recommended_evolution_time(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    *,
+    phase: float = 1.0,
+) -> float:
+    """Choose ``t`` with ``‖H‖₂ t ≈ phase`` so product-formula error is visible."""
+    alpha = spectral_norm_hermitian_sparse(hamiltonian)
+    if alpha <= 0:
+        return float(phase)
+    return float(phase) / alpha
+
+
+def summarize_full3d_sparse_reference(
+    grid_sizes: tuple[tuple[int, int, int], ...] = (
+        (2, 2, 2),
+        (4, 4, 2),
+        (4, 4, 4),
+        (6, 6, 4),
+        (6, 6, 6),
+    ),
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    time: float | None = None,
+    rng_seed: int = 0,
+    max_dense_dim: int = 128,
+    evol_phase: float = 1.0,
+) -> pd.DataFrame:
+    """
+    (A) Full-3D sparse build + ``expm_multiply`` reference wall times.
+
+    If ``time`` is ``None``, uses :func:`recommended_evolution_time` with
+    ``evol_phase``. Optionally compares dense ``expm`` when
+    ``N_s <= max_dense_dim`` (peer of clinic ``MatrixExponential``).
+    """
+    rng = np.random.default_rng(rng_seed)
+    rows: list[dict[str, object]] = []
+    for nx, ny, nz in grid_sizes:
+        t0 = time_mod.perf_counter()
+        built = build_clinic_sparse_hamiltonian(
+            nx, ny, nz, add_fractures=add_fractures, dx=dx
+        )
+        t_build = time_mod.perf_counter() - t0
+        h = built["H"]
+        n = int(built["N_s"])
+        alpha = spectral_norm_hermitian_sparse(h)
+        t_evol = (
+            float(time)
+            if time is not None
+            else recommended_evolution_time(h, phase=evol_phase)
+        )
+        psi0 = rng.normal(size=n) + 1j * rng.normal(size=n)
+        psi0 /= np.linalg.norm(psi0)
+
+        t1 = time_mod.perf_counter()
+        psi_sparse = evolve_state_sparse(h, psi0, t_evol)
+        t_sparse = time_mod.perf_counter() - t1
+
+        dense_err = None
+        t_dense = None
+        if n <= max_dense_dim:
+            t2 = time_mod.perf_counter()
+            psi_dense = evolve_state_dense_expm(h, psi0, t_evol)
+            t_dense = time_mod.perf_counter() - t2
+            dense_err = float(np.linalg.norm(psi_sparse - psi_dense))
+
+        rows.append(
+            {
+                "nx": nx,
+                "ny": ny,
+                "nz": nz,
+                "N_s": n,
+                "nnz": built["nnz"],
+                "alpha_H": alpha,
+                "time": t_evol,
+                "hermitian_err": built["hermitian_err"],
+                "t_build_s": t_build,
+                "t_sparse_expm_s": t_sparse,
+                "t_dense_expm_s": t_dense,
+                "sparse_vs_dense_psi": dense_err,
+                "used_dense_baseline": dense_err is not None,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def split_hamiltonian_hermitian_parts(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    *,
+    method: str = "checkerboard",
+) -> tuple[sp.csr_matrix, sp.csr_matrix]:
+    """
+    Hermitian two-term split ``H = H1 + H2`` for product formulas.
+
+    ``method``:
+      * ``\"checkerboard\"`` — partition off-diagonal edges by ``(i+j) mod 2``
+        (non-commuting; Strang error visibly decreases with ``n_steps``);
+      * ``\"tril\"`` — ``H1 = L + L^\\dagger + D/2`` with ``L = tril(H,-1)``
+        (often nearly commuting for clinic ``H``).
+    """
+    h = sp.csr_matrix(hamiltonian, dtype=complex)
+    if method == "tril":
+        diag = sp.diags(h.diagonal(), format="csr", dtype=complex)
+        lower = sp.tril(h, k=-1).tocsr()
+        h1 = (lower + lower.conj().T + 0.5 * diag).tocsr()
+        h2 = (h - h1).tocsr()
+        return h1, h2
+    if method != "checkerboard":
+        raise ValueError("method must be 'checkerboard' or 'tril'")
+
+    coo = h.tocoo()
+    n = h.shape[0]
+    diag = h.diagonal()
+    r1: list[int] = []
+    c1: list[int] = []
+    d1: list[complex] = []
+    r2: list[int] = []
+    c2: list[int] = []
+    d2: list[complex] = []
+    for i, j, val in zip(coo.row, coo.col, coo.data):
+        if i >= j:
+            continue
+        if ((i + j) & 1) == 0:
+            r1.extend([i, j])
+            c1.extend([j, i])
+            d1.extend([val, np.conj(val)])
+        else:
+            r2.extend([i, j])
+            c2.extend([j, i])
+            d2.extend([val, np.conj(val)])
+    half_diag = 0.5 * sp.diags(diag, format="csr", dtype=complex)
+    h1 = sp.csr_matrix((d1, (r1, c1)), shape=(n, n), dtype=complex) + half_diag
+    h2 = sp.csr_matrix((d2, (r2, c2)), shape=(n, n), dtype=complex) + half_diag
+    return h1.tocsr(), h2.tocsr()
+
+
+def evolve_state_trotter(
+    h1: sp.spmatrix | np.ndarray,
+    h2: sp.spmatrix | np.ndarray,
+    psi0: np.ndarray,
+    time: float,
+    n_steps: int,
+    *,
+    order: int = 2,
+) -> np.ndarray:
+    """
+    Classical Suzuki–Trotter / product-formula evolution on sparse pieces.
+
+    * ``order=1``: Lie–Trotter ``(e^{-i H1 Δt} e^{-i H2 Δt})^r``, ``Δt = t/r``
+    * ``order=2``: Strang ``(e^{-i H1 Δt/2} e^{-i H2 Δt} e^{-i H1 Δt/2})^r``
+    """
+    if n_steps < 1:
+        raise ValueError("n_steps must be >= 1")
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2")
+    psi = np.asarray(psi0, dtype=complex).copy()
+    dt = float(time) / float(n_steps)
+    a = sp.csr_matrix(h1, dtype=complex)
+    b = sp.csr_matrix(h2, dtype=complex)
+    if order == 1:
+        for _ in range(n_steps):
+            psi = expm_multiply(-1j * a * dt, psi)
+            psi = expm_multiply(-1j * b * dt, psi)
+    else:
+        for _ in range(n_steps):
+            psi = expm_multiply(-1j * a * (0.5 * dt), psi)
+            psi = expm_multiply(-1j * b * dt, psi)
+            psi = expm_multiply(-1j * a * (0.5 * dt), psi)
+    return psi
+
+
+def compare_trotter_to_sparse_reference(
+    grid_sizes: tuple[tuple[int, int, int], ...] = (
+        (2, 2, 2),
+        (4, 4, 4),
+        (6, 6, 6),
+    ),
+    *,
+    n_steps_list: tuple[int, ...] = (1, 2, 4, 8, 16),
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    time: float | None = None,
+    order: int = 2,
+    split_method: str = "checkerboard",
+    rng_seed: int = 0,
+    max_dense_dim: int = 128,
+    trotter_phase: float = 1.0,
+) -> pd.DataFrame:
+    """
+    (B) Strang/Lie–Trotter vs sparse ``expm_multiply`` reference on 3D grids.
+
+    If ``time`` is ``None``, uses :func:`recommended_evolution_time` so
+    ``‖H‖₂ t ≈ trotter_phase`` (default 1) and step-size convergence is visible.
+    On tiny systems also reports error vs dense ``expm`` (MatrixExponential peer).
+    """
+    rng = np.random.default_rng(rng_seed)
+    rows: list[dict[str, object]] = []
+    for nx, ny, nz in grid_sizes:
+        built = build_clinic_sparse_hamiltonian(
+            nx, ny, nz, add_fractures=add_fractures, dx=dx
+        )
+        h = built["H"]
+        n = int(built["N_s"])
+        alpha = spectral_norm_hermitian_sparse(h)
+        t_evol = (
+            float(time)
+            if time is not None
+            else recommended_evolution_time(h, phase=trotter_phase)
+        )
+        psi0 = rng.normal(size=n) + 1j * rng.normal(size=n)
+        psi0 /= np.linalg.norm(psi0)
+
+        t_ref0 = time_mod.perf_counter()
+        psi_ref = evolve_state_sparse(h, psi0, t_evol)
+        t_ref = time_mod.perf_counter() - t_ref0
+
+        psi_dense = None
+        if n <= max_dense_dim:
+            psi_dense = evolve_state_dense_expm(h, psi0, t_evol)
+
+        h1, h2 = split_hamiltonian_hermitian_parts(h, method=split_method)
+        split_err = float(np.max(np.abs((h1 + h2 - h).toarray())))
+        h1_herm = hermitian_error(h1)
+        h2_herm = hermitian_error(h2)
+
+        for n_steps in n_steps_list:
+            t0 = time_mod.perf_counter()
+            psi_tr = evolve_state_trotter(h1, h2, psi0, t_evol, n_steps, order=order)
+            t_tr = time_mod.perf_counter() - t0
+            err_sparse = float(np.linalg.norm(psi_tr - psi_ref))
+            err_dense = (
+                float(np.linalg.norm(psi_tr - psi_dense))
+                if psi_dense is not None
+                else None
+            )
+            rows.append(
+                {
+                    "nx": nx,
+                    "ny": ny,
+                    "nz": nz,
+                    "N_s": n,
+                    "nnz": built["nnz"],
+                    "alpha_H": alpha,
+                    "time": t_evol,
+                    "order": order,
+                    "split_method": split_method,
+                    "n_steps": n_steps,
+                    "dt": t_evol / n_steps,
+                    "split_recon_err": split_err,
+                    "H1_herm_err": h1_herm,
+                    "H2_herm_err": h2_herm,
+                    "psi_err_vs_sparse": err_sparse,
+                    "psi_err_vs_dense": err_dense,
+                    "t_sparse_ref_s": t_ref,
+                    "t_trotter_s": t_tr,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# (C) QSVT Hamiltonian simulation (query model) + method comparison
+# ---------------------------------------------------------------------------
+
+
+def chebyshev_coefficients_on_interval(
+    func,
+    degree: int,
+    *,
+    a: float = -1.0,
+    b: float = 1.0,
+    n_points: int = 512,
+) -> np.ndarray:
+    """
+    Complex Chebyshev coefficients on ``[a, b]`` via ``numpy.polynomial.chebyshev``.
+
+    Returns ``c[0], …, c[degree]`` for ``Σ_k c_k T_k(x̃)`` with
+    ``x̃ = (2x - (a+b)) / (b-a)`` mapped to ``[-1, 1]``.
+    """
+    if degree < 0:
+        raise ValueError("degree must be >= 0")
+    from numpy.polynomial.chebyshev import chebfit
+
+    xs = np.linspace(a, b, n_points)
+    ys = np.asarray([func(x) for x in xs], dtype=complex)
+    xtilde = (2.0 * xs - (a + b)) / (b - a)
+    cr = chebfit(xtilde, ys.real, degree)
+    ci = chebfit(xtilde, ys.imag, degree)
+    return cr + 1j * ci
+
+
+def _apply_chebyshev_series_to_state(
+    bop: sp.csr_matrix,
+    psi: np.ndarray,
+    coeffs: np.ndarray,
+) -> np.ndarray:
+    """Evaluate ``Σ_k c_k T_k(B) |ψ⟩`` with three-term recurrence."""
+    d = len(coeffs) - 1
+    if d < 0:
+        raise ValueError("coeffs must be non-empty")
+    if d == 0:
+        return coeffs[0] * psi
+    t_prev = psi.copy()
+    t_curr = bop @ psi
+    out = coeffs[0] * t_prev + coeffs[1] * t_curr
+    for k in range(2, d + 1):
+        t_next = 2.0 * (bop @ t_curr) - t_prev
+        out = out + coeffs[k] * t_next
+        t_prev, t_curr = t_curr, t_next
+    return out
+
+
+def qsvt_polynomial_degree_estimate(
+    alpha: float,
+    time: float,
+    *,
+    epsilon: float = 1e-3,
+) -> int:
+    """
+    Query-degree estimate for Hamiltonian simulation via QSVT / QSP.
+
+    Uses the standard scaling ``d ~ ⌈α t + log₂(1/ε)⌉`` (Low–Chuang / Gilyén).
+    """
+    if alpha < 0 or time < 0 or epsilon <= 0:
+        raise ValueError("alpha, time >= 0 and epsilon > 0 required")
+    return max(1, int(np.ceil(alpha * time + np.log2(1.0 / epsilon))))
+
+
+def subnormalization_amplification_ledger(
+    alpha_mono: float,
+    alpha_factored: float,
+    time: float,
+    *,
+    epsilon: float = 1e-3,
+) -> dict[str, float]:
+    """
+  Amplification / QSVT ledger for monolithic vs product block encodings.
+
+  ``kappa = alpha_factored / alpha_mono`` measures subnormalization inflation
+  from composing ``U_B U_A U_B`` (``alpha_factored = alpha_A alpha_B^2``).
+
+  ``C_amp = alpha * d`` with ``d ~ alpha * t + log2(1/epsilon)`` is a coarse
+  end-to-end amplification-aware cost proxy (AA ~ ``O(alpha)`` per query,
+  QSVT degree ~ ``O(alpha t)``). Compare ``C_amp_ratio`` to oracle ``T`` savings.
+  """
+    if alpha_mono <= 0:
+        raise ValueError("alpha_mono must be positive")
+    if alpha_factored < 0:
+        raise ValueError("alpha_factored must be >= 0")
+    kappa = float(alpha_factored / alpha_mono)
+    d_mono = qsvt_polynomial_degree_estimate(alpha_mono, time, epsilon=epsilon)
+    d_fact = qsvt_polynomial_degree_estimate(alpha_factored, time, epsilon=epsilon)
+    c_amp_mono = float(alpha_mono * d_mono)
+    c_amp_fact = float(alpha_factored * d_fact)
+    c_amp_ratio = (
+        float(c_amp_fact / c_amp_mono) if c_amp_mono > 0 else float("inf")
+    )
+    return {
+        "kappa": kappa,
+        "log2_kappa": float(np.log2(kappa)) if kappa > 0 else float("inf"),
+        "qsvt_degree_mono": float(d_mono),
+        "qsvt_degree_factored": float(d_fact),
+        "C_amp_mono": c_amp_mono,
+        "C_amp_factored": c_amp_fact,
+        "C_amp_ratio": c_amp_ratio,
+        "evol_time": float(time),
+        "qsvt_epsilon": float(epsilon),
+    }
+
+
+def evolve_state_qsvt_chebyshev(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    psi0: np.ndarray,
+    time: float,
+    *,
+    degree: int | None = None,
+    alpha: float | None = None,
+    epsilon: float = 1e-3,
+) -> tuple[np.ndarray, int, float]:
+    """
+    Classical QSVT-equivalent evolution via a Chebyshev series in ``H/α``.
+
+    QSVT with a degree-``d`` polynomial uses ``O(d)`` queries to a block
+    encoding of ``H/α``; this routine evaluates the same polynomial on ``H``
+    using sparse matvecs (no dense ``U_H``).
+    """
+    h = sp.csr_matrix(hamiltonian, dtype=complex)
+    psi = np.asarray(psi0, dtype=complex)
+    if psi.shape[0] != h.shape[0]:
+        raise ValueError("psi0 length must match Hamiltonian dimension.")
+    alpha_val = float(spectral_norm_hermitian_sparse(h) if alpha is None else alpha)
+    if alpha_val <= 0:
+        alpha_val = 1.0
+    d = (
+        int(degree)
+        if degree is not None
+        else qsvt_polynomial_degree_estimate(alpha_val, time, epsilon=epsilon)
+    )
+
+    def g(x: float) -> complex:
+        return np.exp(-1j * alpha_val * time * x)
+
+    coeffs = chebyshev_coefficients_on_interval(g, d)
+    return _apply_chebyshev_series_to_state(h / alpha_val, psi, coeffs), d, alpha_val
+
+
+def evolve_state_qsvt_chebyshev_adaptive(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    psi0: np.ndarray,
+    psi_ref: np.ndarray,
+    time: float,
+    *,
+    alpha: float | None = None,
+    epsilon: float = 1e-3,
+    degree_start: int | None = None,
+    degree_max: int = 120,
+    degree_step: int = 4,
+) -> tuple[np.ndarray, int, float]:
+    """
+    Increase QSVT polynomial degree until ``‖ψ_qsvt - ψ_ref‖₂ < ε``.
+
+    Used for tiny-grid numerical checks; ``degree_max`` caps runtime.
+    """
+    h = sp.csr_matrix(hamiltonian, dtype=complex)
+    alpha_val = float(spectral_norm_hermitian_sparse(h) if alpha is None else alpha)
+    if alpha_val <= 0:
+        alpha_val = 1.0
+    d0 = (
+        degree_start
+        if degree_start is not None
+        else qsvt_polynomial_degree_estimate(alpha_val, time, epsilon=epsilon)
+    )
+
+    def g(x: float) -> complex:
+        return np.exp(-1j * alpha_val * time * x)
+
+    bop = h / alpha_val
+    psi = np.asarray(psi0, dtype=complex)
+    ref = np.asarray(psi_ref, dtype=complex)
+    best_psi = psi.copy()
+    best_d = d0
+    best_err = float("inf")
+    for d in range(d0, degree_max + 1, degree_step):
+        coeffs = chebyshev_coefficients_on_interval(g, d)
+        cand = _apply_chebyshev_series_to_state(bop, psi, coeffs)
+        err = float(np.linalg.norm(cand - ref))
+        if err < best_err:
+            best_err, best_psi, best_d = err, cand, d
+        if err < epsilon:
+            return cand, d, alpha_val
+    return best_psi, best_d, alpha_val
+
+
+def qsvt_block_encoding_cost_model(
+    oracle: HamiltonianOracleLabeling,
+    time: float,
+    *,
+    epsilon: float = 1e-3,
+) -> dict[str, object]:
+    """
+    QSVT cost ledger: ``queries × cost(U_H)`` using explicit §13 T-counts.
+
+    ``queries`` is the estimated QSVT polynomial degree; ``t_uh_one_query`` is
+    from :func:`explicit_hamiltonian_uh_t_budget`.
+    """
+    h_oracle = hamiltonian_from_oracles(oracle)
+    alpha = float(spectral_scale(np.asarray(h_oracle).imag))
+    if alpha < 1e-15:
+        alpha = 1.0
+    queries = qsvt_polynomial_degree_estimate(alpha, time, epsilon=epsilon)
+    uh_budget = explicit_hamiltonian_uh_t_budget(oracle)
+    t_per_query = int(uh_budget["t_uh_one_query"])
+    return {
+        "alpha": alpha,
+        "time": float(time),
+        "epsilon": float(epsilon),
+        "qsvt_queries": queries,
+        "t_uh_one_query": t_per_query,
+        "t_qsvt_total_est": int(queries * t_per_query),
+        "n_qubits_uh": int(oracle.num_qubits_uh),
+        "nnz": len(oracle.entries_by_dm),
+    }
+
+
+def compare_evolution_methods(
+    nx: int,
+    ny: int,
+    nz: int,
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    time: float | None = None,
+    evol_phase: float = 1.0,
+    trotter_steps: int = 16,
+    trotter_order: int = 2,
+    qsvt_epsilon: float = 1e-3,
+    qsvt_degree: int | None = None,
+    rng_seed: int = 0,
+    max_dense_dim: int = 128,
+    include_oracle_cost: bool = True,
+) -> dict[str, object]:
+    """
+    Compare evolution methods on one 3D grid.
+
+    Methods:
+      * ``sparse_expm`` — ``expm_multiply`` reference;
+      * ``dense_expm`` — dense ``expm`` / ``MatrixExponential`` peer (tiny only);
+      * ``trotter`` — Strang Suzuki–Trotter (checkerboard split);
+      * ``qsvt`` — Chebyshev / QSVT-equivalent polynomial in ``H/α``;
+      * ``pauli_baseline`` — term count only (tiny only).
+    """
+    built = build_clinic_sparse_hamiltonian(nx, ny, nz, add_fractures=add_fractures, dx=dx)
+    h = built["H"]
+    n = int(built["N_s"])
+    alpha = spectral_norm_hermitian_sparse(h)
+    t_evol = (
+        float(time) if time is not None else recommended_evolution_time(h, phase=evol_phase)
+    )
+    rng = np.random.default_rng(rng_seed)
+    psi0 = rng.normal(size=n) + 1j * rng.normal(size=n)
+    psi0 /= np.linalg.norm(psi0)
+
+    t0 = time_mod.perf_counter()
+    psi_ref = evolve_state_sparse(h, psi0, t_evol)
+    t_sparse = time_mod.perf_counter() - t0
+
+    out: dict[str, object] = {
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "N_s": n,
+        "nnz": built["nnz"],
+        "alpha_H": alpha,
+        "time": t_evol,
+        "t_sparse_ref_s": t_sparse,
+    }
+
+    psi_dense = None
+    if n <= max_dense_dim:
+        t_d0 = time_mod.perf_counter()
+        psi_dense = evolve_state_dense_expm(h, psi0, t_evol)
+        t_dense = time_mod.perf_counter() - t_d0
+        pauli = matrix_exponential_pauli_stats(h.toarray())
+        out.update(
+            {
+                "dense_expm_err": float(np.linalg.norm(psi_dense - psi_ref)),
+                "t_dense_expm_s": t_dense,
+                "n_pauli_terms": int(pauli["n_pauli_terms"]),
+            }
+        )
+
+    h1, h2 = split_hamiltonian_hermitian_parts(h, method="checkerboard")
+    t_tr0 = time_mod.perf_counter()
+    psi_tr = evolve_state_trotter(h1, h2, psi0, t_evol, trotter_steps, order=trotter_order)
+    t_tr = time_mod.perf_counter() - t_tr0
+    out.update(
+        {
+            "trotter_steps": trotter_steps,
+            "trotter_order": trotter_order,
+            "trotter_err": float(np.linalg.norm(psi_tr - psi_ref)),
+            "t_trotter_s": t_tr,
+        }
+    )
+    if psi_dense is not None:
+        out["trotter_err_vs_dense"] = float(np.linalg.norm(psi_tr - psi_dense))
+
+    t_q0 = time_mod.perf_counter()
+    if n <= max_dense_dim:
+        psi_qsvt, degree, _alpha_q = evolve_state_qsvt_chebyshev_adaptive(
+            h, psi0, psi_ref, t_evol, alpha=alpha, epsilon=qsvt_epsilon
+        )
+    else:
+        psi_qsvt, degree, _alpha_q = evolve_state_qsvt_chebyshev(
+            h, psi0, t_evol, degree=qsvt_degree, alpha=alpha, epsilon=qsvt_epsilon
+        )
+    t_q = time_mod.perf_counter() - t_q0
+    out.update(
+        {
+            "qsvt_degree": degree,
+            "qsvt_epsilon": qsvt_epsilon,
+            "qsvt_err": float(np.linalg.norm(psi_qsvt - psi_ref)),
+            "t_qsvt_s": t_q,
+            "qsvt_queries": degree,
+        }
+    )
+    if psi_dense is not None:
+        out["qsvt_err_vs_dense"] = float(np.linalg.norm(psi_qsvt - psi_dense))
+
+    if include_oracle_cost and n <= 256:
+        try:
+            demo = build_minimal_hamiltonian_demo(nx, ny, nz, add_fractures=add_fractures, dx=dx)
+            cost = qsvt_block_encoding_cost_model(
+                demo["oracle"], t_evol, epsilon=qsvt_epsilon
+            )
+            out["t_uh_one_query"] = cost["t_uh_one_query"]
+            out["t_qsvt_circuit_est"] = int(degree) * int(cost["t_uh_one_query"])
+            out["n_qubits_uh"] = cost["n_qubits_uh"]
+        except Exception:
+            pass
+
+    return out
+
+
+def summarize_evolution_methods_comparison(
+    grid_sizes: tuple[tuple[int, int, int], ...] = (
+        (2, 2, 2),
+        (4, 4, 4),
+        (6, 6, 6),
+    ),
+    *,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    time: float | None = None,
+    evol_phase: float = 1.0,
+    trotter_steps: int = 16,
+    qsvt_epsilon: float = 1e-3,
+    rng_seed: int = 0,
+    max_dense_dim: int = 128,
+) -> pd.DataFrame:
+    """Run :func:`compare_evolution_methods` on several full-3D grids."""
+    rows: list[dict[str, object]] = []
+    for nx, ny, nz in grid_sizes:
+        rows.append(
+            compare_evolution_methods(
+                nx,
+                ny,
+                nz,
+                add_fractures=add_fractures,
+                dx=dx,
+                time=time,
+                evol_phase=evol_phase,
+                trotter_steps=trotter_steps,
+                qsvt_epsilon=qsvt_epsilon,
+                rng_seed=rng_seed,
+                max_dense_dim=max_dense_dim,
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Factored block encoding: U_H ~ U_B U_A U_B  (B^{-1/2}, iA)
+# ---------------------------------------------------------------------------
+
+
+def is_nearly_diagonal(matrix: np.ndarray, *, tol: float = 1e-12) -> bool:
+    """True if off-diagonal max-abs is below ``tol``."""
+    dense = np.asarray(matrix)
+    off = dense.copy()
+    np.fill_diagonal(off, 0.0)
+    return float(np.max(np.abs(off))) <= tol
+
+
+def build_factored_hamiltonian_oracles(
+    demo: dict[str, object] | None = None,
+    *,
+    nx: int = 2,
+    ny: int = 2,
+    nz: int = 2,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+) -> dict[str, object]:
+    """
+    Pechan oracles for ``iA`` and diagonal ``B^{-1/2}``, plus product check.
+
+    Uses an existing ``build_minimal_hamiltonian_demo`` dict when provided.
+    """
+    if demo is None:
+        demo = build_minimal_hamiltonian_demo(
+            nx, ny, nz, add_fractures=add_fractures, dx=dx
+        )
+    factors = demo["factors"]
+    a_dense = dense_matrix(demo["A"])
+    bis_dense = dense_matrix(demo["B_inv_sqrt"])
+    i_a = 1j * a_dense
+    h_dense = dense_matrix(demo["H"])
+
+    oracle_a = build_hamiltonian_oracle_labeling(factors["labeling_iA"], i_a)
+    oracle_b = build_hamiltonian_oracle_labeling(
+        factors["labeling_B_inv_sqrt"], bis_dense
+    )
+    alpha_a = spectral_scale(i_a.imag)
+    alpha_b = spectral_scale(bis_dense.real)
+    if alpha_a < 1e-15:
+        alpha_a = 1.0
+    if alpha_b < 1e-15:
+        alpha_b = 1.0
+
+    a_rec = hamiltonian_from_oracles(oracle_a)
+    b_rec = hamiltonian_from_oracles(oracle_b)
+    product_dense = bis_dense @ i_a @ bis_dense
+    product_oracle = b_rec @ a_rec @ b_rec
+    product_err = float(np.max(np.abs(product_dense - h_dense)))
+    product_err_oracle = float(np.max(np.abs(product_oracle - h_dense)))
+    recon_err_a = float(np.max(np.abs(a_rec - i_a)))
+    recon_err_b = float(np.max(np.abs(b_rec - bis_dense)))
+
+    return {
+        "demo": demo,
+        "oracle_A": oracle_a,
+        "oracle_B": oracle_b,
+        "alpha_A": float(alpha_a),
+        "alpha_B": float(alpha_b),
+        "alpha_factored": float(alpha_b * alpha_b * alpha_a),
+        "A_rec": a_rec,
+        "B_rec": b_rec,
+        "H_product": product_dense,
+        "H_product_oracle": product_oracle,
+        "product_err": product_err,
+        "product_err_oracle": product_err_oracle,
+        "recon_err_A": recon_err_a,
+        "recon_err_B": recon_err_b,
+        "B_is_diagonal": is_nearly_diagonal(bis_dense),
+        "verify_index_A": verify_staggered_index_oracles(oracle_a),
+        "verify_index_B": verify_staggered_index_oracles(oracle_b),
+    }
+
+
+def explicit_diagonal_be_t_budget(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    eps: float = 1e-10,
+) -> dict[str, object]:
+    """
+    Cheaper ledger when the encoded matrix is diagonal.
+
+    Keeps multiplexed ``O_data`` and column lookup ``O_c`` (maps ``(d,m)→i``),
+    but drops row / transpose oracles (``i=j`` already). Also reports an
+    arithmetic-style SELECT estimate: ``D'`` controlled rotations on the
+    index register (material values as a function of site).
+    """
+    index = explicit_index_oracle_t_counts(oracle)
+    odata = explicit_odata_t_count(
+        oracle.base.d_prime, oracle.n_d_qubits, eps=eps
+    )
+    t_lookup_diag = int(index["t_oc"] + odata["t_odata"])
+    t_select_arith = int(
+        oracle.base.d_prime
+        * t_count_controlled_rotation(oracle.n_index_qubits, eps=eps)
+    )
+    t_arith_index = int(
+        t_count_adder_theory(oracle.n_index_qubits)
+        + t_count_mcx(oracle.n_d_qubits) * max(oracle.base.d_prime, 0)
+    )
+    return {
+        **{k: index[k] for k in ("n_mcx_oc", "t_oc", "t_or", "t_ot")},
+        **odata,
+        "eps": eps,
+        "t_uh_one_query": t_lookup_diag,
+        "t_uh_arith_theory": int(t_arith_index + odata["t_odata"]),
+        "t_select_arith_theory": t_select_arith,
+        "dropped_row_transpose": True,
+    }
+
+
+def build_factored_product_circuit(
+    oracle_a: HamiltonianOracleLabeling,
+    oracle_b: HamiltonianOracleLabeling,
+    *,
+    materialize_lookup: bool | str = "opaque",
+    alpha_a: float | None = None,
+    alpha_b: float | None = None,
+) -> tuple[QuantumCircuit, float, dict[str, object]]:
+    """
+    Schematic product block encoding ``U_B U_A U_B``.
+
+    Layout: ``anc_B | anc_A | idx`` where each ancilla bundle is
+    ``data | d | m`` for that factor. Shared system register is ``idx``.
+    Fresh ancillas for ``A`` and ``B`` (product-of-BEs; scale
+    ``α_H = α_B² α_A``).
+
+    Correctness of the *operators* is checked classically via
+    :func:`build_factored_hamiltonian_oracles`; this circuit is the register
+    / cost footprint for the factored path (opaque lookup by default).
+    """
+    if oracle_a.n_index_qubits != oracle_b.n_index_qubits:
+        raise ValueError("Factored product requires matching index register sizes.")
+    if oracle_a.n_index_padded != oracle_b.n_index_padded:
+        raise ValueError("Factored product requires matching padded index dimensions.")
+
+    circ_a, a_a = build_hamiltonian_block_encoding_circuit(
+        oracle_a,
+        scale=alpha_a,
+        materialize_lookup=materialize_lookup,
+        use_imag=True,
+        name="U_A",
+    )
+    circ_b, a_b = build_hamiltonian_block_encoding_circuit(
+        oracle_b,
+        scale=alpha_b,
+        materialize_lookup=materialize_lookup,
+        use_imag=False,
+        name="U_B",
+    )
+    n_anc_a = 1 + oracle_a.n_d_qubits + oracle_a.n_m_qubits
+    n_anc_b = 1 + oracle_b.n_d_qubits + oracle_b.n_m_qubits
+    n_idx = oracle_a.n_index_qubits
+    total = n_anc_b + n_anc_a + n_idx
+
+    circuit = QuantumCircuit(total, name="U_B_U_A_U_B")
+    b_q = list(range(0, n_anc_b)) + list(range(n_anc_b + n_anc_a, total))
+    a_q = list(range(n_anc_b, n_anc_b + n_anc_a)) + list(
+        range(n_anc_b + n_anc_a, total)
+    )
+    circuit.compose(circ_b, qubits=b_q, inplace=True)
+    circuit.compose(circ_a, qubits=a_q, inplace=True)
+    circuit.compose(circ_b, qubits=b_q, inplace=True)
+
+    alpha = float(a_b * a_b * a_a)
+    meta = {
+        "n_qubits_factored": total,
+        "n_anc_A": n_anc_a,
+        "n_anc_B": n_anc_b,
+        "n_idx": n_idx,
+        "n_qubits_U_A": oracle_a.num_qubits_uh,
+        "n_qubits_U_B": oracle_b.num_qubits_uh,
+        "alpha_A": float(a_a),
+        "alpha_B": float(a_b),
+        "alpha_factored": alpha,
+        "materialize_lookup": _normalize_lookup_mode(materialize_lookup),
+    }
+    return circuit, alpha, meta
+
+
+def compare_monolithic_vs_factored_costs(
+    oracle_h: HamiltonianOracleLabeling,
+    oracle_a: HamiltonianOracleLabeling,
+    oracle_b: HamiltonianOracleLabeling,
+    *,
+    eps: float = 1e-10,
+    b_is_diagonal: bool | None = None,
+    alpha_mono: float | None = None,
+    alpha_factored: float | None = None,
+    evol_time: float | None = None,
+    qsvt_epsilon: float = 1e-3,
+) -> dict[str, object]:
+    """
+    One-query ``T`` / qubit / ``D'`` contrast: monolithic ``U_H`` vs
+    ``U_B U_A U_B`` (Pechan-on-factors and diagonal-``B`` / arithmetic ledgers).
+
+    When ``alpha_mono`` and ``alpha_factored`` are given (with ``evol_time``),
+    also reports ``kappa`` and ``C_amp_*`` amplification ledger columns.
+    """
+    if b_is_diagonal is None:
+        b_is_diagonal = is_nearly_diagonal(oracle_b.matrix)
+
+    cost_h = explicit_hamiltonian_uh_t_budget(oracle_h, eps=eps)
+    cost_a = explicit_hamiltonian_uh_t_budget(oracle_a, eps=eps)
+    cost_b = explicit_hamiltonian_uh_t_budget(oracle_b, eps=eps)
+    cost_b_diag = (
+        explicit_diagonal_be_t_budget(oracle_b, eps=eps) if b_is_diagonal else None
+    )
+
+    t_fact_lookup = int(
+        2 * int(cost_b["t_uh_one_query"]) + int(cost_a["t_uh_one_query"])
+    )
+    t_fact_arith = int(
+        2 * int(cost_b["t_uh_arith_theory"]) + int(cost_a["t_uh_arith_theory"])
+    )
+    t_fact_diag_lookup = None
+    t_fact_diag_arith = None
+    t_fact_select = None
+    if cost_b_diag is not None:
+        t_fact_diag_lookup = int(
+            2 * int(cost_b_diag["t_uh_one_query"]) + int(cost_a["t_uh_one_query"])
+        )
+        t_fact_diag_arith = int(
+            2 * int(cost_b_diag["t_uh_arith_theory"])
+            + int(cost_a["t_uh_arith_theory"])
+        )
+        t_fact_select = int(
+            2 * int(cost_b_diag["t_select_arith_theory"])
+            + int(cost_a["t_uh_arith_theory"])
+        )
+
+    n_anc_a = 1 + oracle_a.n_d_qubits + oracle_a.n_m_qubits
+    n_anc_b = 1 + oracle_b.n_d_qubits + oracle_b.n_m_qubits
+    n_factored = n_anc_a + n_anc_b + oracle_a.n_index_qubits
+
+    out: dict[str, object] = {
+        "D_prime_H": oracle_h.base.d_prime,
+        "D_prime_A": oracle_a.base.d_prime,
+        "D_prime_B": oracle_b.base.d_prime,
+        "nnz_H": len(oracle_h.entries_by_dm),
+        "nnz_A": len(oracle_a.entries_by_dm),
+        "nnz_B": len(oracle_b.entries_by_dm),
+        "n_qubits_monolithic": oracle_h.num_qubits_uh,
+        "n_qubits_factored": n_factored,
+        "B_is_diagonal": bool(b_is_diagonal),
+        "t_H_lookup": int(cost_h["t_uh_one_query"]),
+        "t_H_arith": int(cost_h["t_uh_arith_theory"]),
+        "t_A_lookup": int(cost_a["t_uh_one_query"]),
+        "t_B_lookup": int(cost_b["t_uh_one_query"]),
+        "t_factored_lookup": t_fact_lookup,
+        "t_factored_arith": t_fact_arith,
+        "t_factored_diag_lookup": t_fact_diag_lookup,
+        "t_factored_diag_arith": t_fact_diag_arith,
+        "t_factored_Bselect_Aarith": t_fact_select,
+        "winner_lookup": (
+            "monolithic"
+            if int(cost_h["t_uh_one_query"]) <= t_fact_lookup
+            else "factored_pechan"
+        ),
+        "winner_arith": (
+            "monolithic"
+            if int(cost_h["t_uh_arith_theory"]) <= t_fact_arith
+            else "factored_pechan"
+        ),
+        "winner_best_factored": (
+            "monolithic"
+            if t_fact_select is None
+            or int(cost_h["t_uh_arith_theory"]) <= min(
+                t_fact_arith,
+                t_fact_diag_arith or t_fact_arith,
+                t_fact_select,
+            )
+            else "factored_specialized"
+        ),
+    }
+    if (
+        alpha_mono is not None
+        and alpha_factored is not None
+        and evol_time is not None
+    ):
+        amp = subnormalization_amplification_ledger(
+            float(alpha_mono),
+            float(alpha_factored),
+            float(evol_time),
+            epsilon=qsvt_epsilon,
+        )
+        out.update(amp)
+    return out
+
+
+def summarize_monolithic_vs_factored(
+    grid_sizes: tuple[tuple[int, int, int], ...] = (
+        (2, 2, 2),
+        (4, 2, 2),
+        (4, 4, 2),
+        (6, 6, 6),
+    ),
+    *,
+    add_fractures: bool = True,
+    dx: float = 0.05,
+    eps: float = 1e-10,
+    evol_time: float | None = None,
+    evol_phase: float = 1.0,
+    qsvt_epsilon: float = 1e-3,
+) -> pd.DataFrame:
+    """Sweep grids: classical product check + monolithic vs factored ``T``.
+
+    Default primary case is clinic materials **with fractures**, including the
+    §15 cube ``6×6×6``. Set ``add_fractures=False`` for the homogeneous contrast.
+
+    Includes ``kappa = alpha_factored/alpha_H`` and ``C_amp_*`` when evolution
+  time is set or computed via :func:`recommended_evolution_time`.
+    """
+    rows: list[dict[str, object]] = []
+    for nx, ny, nz in grid_sizes:
+        packed = build_factored_hamiltonian_oracles(
+            nx=nx, ny=ny, nz=nz, add_fractures=add_fractures, dx=dx
+        )
+        demo = packed["demo"]
+        alpha_h = float(spectral_scale(dense_matrix(demo["H"]).imag))
+        t_evol = (
+            float(evol_time)
+            if evol_time is not None
+            else recommended_evolution_time(demo["H"], phase=evol_phase)
+        )
+        costs = compare_monolithic_vs_factored_costs(
+            demo["oracle"],
+            packed["oracle_A"],
+            packed["oracle_B"],
+            eps=eps,
+            b_is_diagonal=packed["B_is_diagonal"],
+            alpha_mono=alpha_h,
+            alpha_factored=packed["alpha_factored"],
+            evol_time=t_evol,
+            qsvt_epsilon=qsvt_epsilon,
+        )
+        rows.append(
+            {
+                "nx": nx,
+                "ny": ny,
+                "nz": nz,
+                "N_s": demo["layout"].n_total,
+                "product_err": packed["product_err"],
+                "product_err_oracle": packed["product_err_oracle"],
+                "alpha_H": alpha_h,
+                "alpha_A": packed["alpha_A"],
+                "alpha_B": packed["alpha_B"],
+                "alpha_factored": packed["alpha_factored"],
+                "evol_time": t_evol,
+                **costs,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def freeze_factored_vs_monolithic_writeup(
+    *,
+    nx: int = 2,
+    ny: int = 2,
+    nz: int = 2,
+    add_fractures: bool = False,
+    dx: float = 0.05,
+    eps: float = 1e-10,
+    evol_time: float | None = None,
+    evol_phase: float = 1.0,
+    qsvt_epsilon: float = 1e-3,
+) -> dict[str, object]:
+    """
+    One-shot Aim-1 comparison artifact: oracles, product circuit, cost table
+    row, and a frozen markdown summary string.
+    """
+    packed = build_factored_hamiltonian_oracles(
+        nx=nx, ny=ny, nz=nz, add_fractures=add_fractures, dx=dx
+    )
+    demo = packed["demo"]
+    alpha_h = float(spectral_scale(dense_matrix(demo["H"]).imag))
+    t_evol = (
+        float(evol_time)
+        if evol_time is not None
+        else recommended_evolution_time(demo["H"], phase=evol_phase)
+    )
+    costs = compare_monolithic_vs_factored_costs(
+        demo["oracle"],
+        packed["oracle_A"],
+        packed["oracle_B"],
+        eps=eps,
+        b_is_diagonal=packed["B_is_diagonal"],
+        alpha_mono=alpha_h,
+        alpha_factored=packed["alpha_factored"],
+        evol_time=t_evol,
+        qsvt_epsilon=qsvt_epsilon,
+    )
+    circuit, alpha, meta = build_factored_product_circuit(
+        packed["oracle_A"],
+        packed["oracle_B"],
+        materialize_lookup="opaque",
+        alpha_a=packed["alpha_A"],
+        alpha_b=packed["alpha_B"],
+    )
+    circ_a, _ = build_hamiltonian_block_encoding_circuit(
+        packed["oracle_A"],
+        scale=packed["alpha_A"],
+        materialize_lookup="opaque",
+        use_imag=True,
+        name="U_A",
+    )
+    circ_b, _ = build_hamiltonian_block_encoding_circuit(
+        packed["oracle_B"],
+        scale=packed["alpha_B"],
+        materialize_lookup="opaque",
+        use_imag=False,
+        name="U_B",
+    )
+
+    md = "\n".join(
+        [
+            r"### Frozen comparison: monolithic $U_H$ vs factored $U_B U_A U_B$",
+            "",
+            f"- Grid: `{nx}×{ny}×{nz}` (`N_s={demo['layout'].n_total}`), "
+            f"fractures=`{add_fractures}`.",
+            f"- Classical product check: "
+            f"`||B^{{-1/2}} (iA) B^{{-1/2}} - H||_max = {packed['product_err']:.3e}` "
+            f"(oracle-assembled product err `{packed['product_err_oracle']:.3e}`).",
+            f"- Scales: `||H||_2` = `{alpha_h:.6g}`; factored `α_B² α_A = {packed['alpha_factored']:.6g}` "
+            f"(α_A={packed['alpha_A']:.6g}, α_B={packed['alpha_B']:.6g}).",
+            f"- Subnormalization inflation: `κ = α_factored/||H||_2 = {costs.get('kappa', float('nan')):.6g}` "
+            f"(log₂ κ = {costs.get('log2_kappa', float('nan')):.2f}).",
+            (
+                f"- Amplification ledger (t={t_evol:.3g}, ε={qsvt_epsilon}): "
+                f"`C_amp_mono = {costs.get('C_amp_mono', float('nan')):.6g}`, "
+                f"`C_amp_factored = {costs.get('C_amp_factored', float('nan')):.6g}`, "
+                f"ratio = **{costs.get('C_amp_ratio', float('nan')):.6g}**."
+                if "C_amp_mono" in costs
+                else ""
+            ),
+            f"- Qubits: monolithic `{costs['n_qubits_monolithic']}` vs factored "
+            f"`{costs['n_qubits_factored']}` (fresh ancillas for A and B).",
+            f"- `D'`: H={costs['D_prime_H']}, A={costs['D_prime_A']}, "
+            f"B={costs['D_prime_B']} (B diagonal={costs['B_is_diagonal']}).",
+            f"- Lookup `T` (one query): monolithic `{costs['t_H_lookup']}` vs "
+            f"factored Pechan `{costs['t_factored_lookup']}` "
+            f"(winner: **{costs['winner_lookup']}**).",
+            f"- Arithmetic-index `T`: monolithic `{costs['t_H_arith']}` vs "
+            f"factored Pechan `{costs['t_factored_arith']}` "
+            f"(winner: **{costs['winner_arith']}**).",
+            "",
+            "**Takeaway.** Compare only monolithic Pechan `U_H` vs factored "
+            "Pechan `U_B U_A U_B`. Monolithic usually wins the *lookup* ledger; "
+            "factored Pechan can win arithmetic `T`, but `κ` and `C_amp_ratio` "
+            "≫ 1 mean amplitude amplification / QSVT overhead likely spoils any "
+            "speedup from separate encodings on clinic elastic grids.",
+        ]
+    )
+
+    return {
+        "packed": packed,
+        "costs": costs,
+        "circuit": circuit,
+        "circuit_A": circ_a,
+        "circuit_B": circ_b,
+        "alpha_factored": alpha,
+        "meta": meta,
+        "markdown": md,
+        "row": {
+            "nx": nx,
+            "ny": ny,
+            "nz": nz,
+            "N_s": demo["layout"].n_total,
+            "product_err": packed["product_err"],
+            "alpha_H": alpha_h,
+            "alpha_factored": packed["alpha_factored"],
+            "evol_time": t_evol,
+            **costs,
+        },
+    }

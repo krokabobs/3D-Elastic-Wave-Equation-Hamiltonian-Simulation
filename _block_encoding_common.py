@@ -155,3 +155,106 @@ def apply_multiplexed_ry(
         [data_qubit] + value_qubits,
         inplace=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Explicit (analytic) T-counts — no Solovay–Kitaev
+# ---------------------------------------------------------------------------
+
+# Exact Clifford+T Toffoli (standard 7-T construction).
+T_PER_TOFFOLI = 7
+
+
+def t_count_mcx(n_controls: int) -> int:
+    """
+    Explicit T-count for an ``n``-controlled NOT (MCX).
+
+    Model (Barenco-style dirty-ancilla cascade, standard for oracle papers):
+      * ``n <= 1``: ``X`` / ``CX`` are Clifford → 0 ``T``
+      * ``n >= 2``: ``2(n-1)`` Toffolis × 7 ``T`` each
+
+    This is a transparent upper-style ledger for lookup oracles; optimized
+    relative-phase constructions can reduce constants but not the ``O(n)``
+    scaling in ``n``.
+    """
+    n = int(n_controls)
+    if n <= 1:
+        return 0
+    return int(2 * (n - 1) * T_PER_TOFFOLI)
+
+
+def t_count_rotation(eps: float = 1e-10) -> int:
+    """
+    Approximate ``T`` cost of one arbitrary-angle single-qubit rotation.
+
+    Uses the standard fault-tolerant scaling ``~ 3 log2(1/ε)`` (order of
+    Ross–Selinger / Solovay–Kitaev-type angle synthesis), not a numerical SK
+    run. Clamp to at least 1 so a nontrivial rotation is never free.
+    """
+    if eps <= 0 or eps >= 1:
+        raise ValueError(f"eps must be in (0, 1); got {eps}")
+    return max(1, int(np.ceil(3.0 * np.log2(1.0 / float(eps)))))
+
+
+def t_count_controlled_rotation(n_controls: int, *, eps: float = 1e-10) -> int:
+    """
+    Explicit ``T`` for one ``C^{n}(R_y)``: one MCX ledger + one angle synthesis.
+
+    Matches the multiplexed ``O_data`` pattern (controlled ``R_y`` about a
+    fixed data qubit). Constants absorb the usual sandwiching Clifford work.
+    """
+    return t_count_mcx(n_controls) + t_count_rotation(eps)
+
+
+def explicit_odata_t_count(
+    d_prime: int,
+    n_value_qubits: int,
+    *,
+    eps: float = 1e-10,
+) -> dict[str, int]:
+    """
+    Analytic ``T`` budget for multiplexed ``O_data`` (no SK, no transpile).
+
+    Circuit shape in :func:`data_loading_subcircuit`:
+      * 1 unrestricted ``R_y``
+      * ``D'-1`` fully controlled ``R_y`` on ``n_value_qubits`` controls
+    """
+    d_prime = int(d_prime)
+    n_value_qubits = int(n_value_qubits)
+    if d_prime < 1:
+        raise ValueError("d_prime must be >= 1")
+    t_ry = t_count_rotation(eps)
+    n_controlled = max(d_prime - 1, 0)
+    t_controlled = n_controlled * t_count_controlled_rotation(n_value_qubits, eps=eps)
+    return {
+        "n_ry": 1,
+        "n_controlled_ry": n_controlled,
+        "n_value_qubits": n_value_qubits,
+        "t_per_rotation": t_ry,
+        "t_odata": int(t_ry + t_controlled),
+    }
+
+
+def naive_unitary_cnot_lower_bound(n_qubits: int) -> int:
+    """
+    CNOT lower bound for a *generic* ``n``-qubit unitary (Shende et al.):
+
+    ``(4^n - 3n - 1) / 4`` (integer floor). Used as the dense / naive baseline.
+    """
+    n = int(n_qubits)
+    if n < 0:
+        raise ValueError("n_qubits must be >= 0")
+    if n == 0:
+        return 0
+    return int((4**n - 3 * n - 1) // 4)
+
+
+def t_count_adder_theory(n_bits: int) -> int:
+    """
+    Order-of-magnitude ``T`` for one ``n``-bit adder (arithmetic index oracle).
+
+    Uses ``~ 8 n`` (Gidney-style linear ``T`` in bit width). Contrast with
+    lookup MCX oracles that scale with ``nnz × n_controls``.
+    """
+    n = max(int(n_bits), 0)
+    return int(8 * n)
