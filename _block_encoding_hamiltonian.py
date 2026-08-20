@@ -8,7 +8,7 @@ import time as time_mod
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, QuantumRegister
 from qiskit.circuit import Gate
 from qiskit.circuit.library import UnitaryGate
 from qiskit.quantum_info import Operator, SparsePauliOp, Statevector
@@ -1328,6 +1328,62 @@ def build_hamiltonian_block_encoding_circuit(
     circuit.append(or_gate, d_regs + m_regs + idx_regs)
 
     return circuit, alpha
+
+
+def build_hamiltonian_block_encoding_schematic(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    scale: float | None = None,
+    use_imag: bool = True,
+    name: str | None = None,
+) -> tuple[QuantumCircuit, float]:
+    """
+    Top-level Pechan skeleton with opaque index oracles and boxed ``O_data``.
+
+    Useful for ``circuit.draw()`` in §8: five named blocks
+    ``O_c^{-1} · O_data · Z · O_t · O_r`` without expanding MCX layers.
+    """
+    target = oracle.matrix.imag if use_imag else oracle.matrix.real
+    alpha = scale if scale is not None else spectral_scale(target)
+    if alpha < 1e-15:
+        alpha = 1.0
+    payload = imag_payload(oracle.base) if use_imag else np.real(oracle.base.value_table)
+
+    n_d = oracle.n_d_qubits
+    n_m = oracle.n_m_qubits
+
+    circuit_name = name if name is not None else ("U_H" if use_imag else "U_M")
+    circuit = QuantumCircuit(oracle.num_qubits_uh, name=circuit_name)
+    data = 0
+    d_regs = list(range(1, 1 + n_d))
+    m_regs = list(range(1 + n_d, 1 + n_d + n_m))
+    idx_regs = list(range(1 + n_d + n_m, circuit.num_qubits))
+    idx_width = len(d_regs + m_regs + idx_regs)
+
+    circuit.append(Gate("O_c_inv", idx_width, []), d_regs + m_regs + idx_regs)
+    odata = data_loading_subcircuit(payload, alpha)
+    circuit.append(odata.to_gate(), [data] + d_regs)
+    circuit.z(data)
+    circuit.append(Gate("O_t", len(d_regs + m_regs), []), d_regs + m_regs)
+    circuit.append(Gate("O_r", idx_width, []), d_regs + m_regs + idx_regs)
+
+    return circuit, alpha
+
+
+def label_hamiltonian_uh_registers(
+    circuit: QuantumCircuit,
+    oracle: HamiltonianOracleLabeling,
+    *,
+    name: str | None = None,
+) -> QuantumCircuit:
+    """Relabel flat ``q_0..q_{n-1}`` wires as ``data | d | m | idx`` for drawing."""
+    data = QuantumRegister(1, "data")
+    d = QuantumRegister(oracle.n_d_qubits, "d")
+    m = QuantumRegister(oracle.n_m_qubits, "m")
+    idx = QuantumRegister(oracle.n_index_qubits, "idx")
+    labeled = QuantumCircuit(data, d, m, idx, name=name or circuit.name)
+    labeled.compose(circuit, list(range(circuit.num_qubits)), inplace=True)
+    return labeled
 
 
 def hamiltonian_odata_gate_budget(
@@ -3030,6 +3086,307 @@ def explicit_diagonal_be_t_budget(
     }
 
 
+def _lame_from_compliance(s6: np.ndarray) -> tuple[float, float]:
+    """Return ``(λ, μ)`` from a 6×6 isotropic compliance matrix ``S = C^{-1}``."""
+    stiffness = np.linalg.inv(np.asarray(s6, dtype=float))
+    return float(stiffness[0, 1]), float(stiffness[3, 3])
+
+
+def _kg_from_lame(lam: float, mu: float) -> tuple[float, float]:
+    """
+    Diagonal/off-diagonal of isotropic ``C_1^{1/2}``.
+
+    ``C_1 = (a-b)I + b 11^T`` with ``a=λ+2μ``, ``b=λ``, so
+    ``k = (√(3λ+2μ) + 2√(2μ))/3``, ``g = (√(3λ+2μ) - √(2μ))/3``.
+    """
+    a = lam + 2.0 * mu
+    b = lam
+    s1 = float(np.sqrt(max(a + 2.0 * b, 0.0)))
+    s2 = float(np.sqrt(max(a - b, 0.0)))
+    return (s1 + 2.0 * s2) / 3.0, (s1 - s2) / 3.0
+
+
+def assemble_paper_b_inv_sqrt(
+    layout: Elastic3DLayout,
+    rho_model: np.ndarray,
+    compliance: np.ndarray,
+) -> sp.csr_matrix:
+    """
+    Paper-form ``B^{-1/2}`` (``apssamp.tex`` / Eq. of ``B^{-1/2}``).
+
+    Block diagonal with diagonal ``P_x,P_y,P_z``, the non-diagonal Lamé
+    ``C_1^{1/2}`` (``K`` on the diagonal, ``G`` off-diagonal among
+    ``σ_xx,σ_yy,σ_zz``), and diagonal shear ``M_1,M_2,M_3``.
+
+    Clinic ``FD_solver_3D_elastic`` instead takes ``√S_{ii}`` independently,
+    so its ``B^{-1/2}`` is strictly diagonal. This constructor restores the
+    paper coupling in the middle block.
+    """
+    nx, ny, nz = layout.nx, layout.ny, layout.nz
+    rho = np.asarray(rho_model, dtype=float)
+    if rho.shape != (nz, ny, nx):
+        raise ValueError(f"rho_model shape {rho.shape} != {(nz, ny, nx)}")
+
+    rho_vx = 0.5 * (rho[:, :, :-1] + rho[:, :, 1:]).reshape(-1)
+    rho_vy = 0.5 * (rho[:, :-1, :] + rho[:, 1:, :]).reshape(-1)
+    rho_vz = 0.5 * (rho[:-1, :, :] + rho[1:, :, :]).reshape(-1)
+
+    n_main = layout.n_main
+    k_vals = np.zeros(n_main, dtype=float)
+    g_vals = np.zeros(n_main, dtype=float)
+    mu_main = np.zeros((nz, ny, nx), dtype=float)
+
+    if compliance.ndim == 2:
+        lam, mu = _lame_from_compliance(compliance)
+        k, g = _kg_from_lame(lam, mu)
+        k_vals[:] = k
+        g_vals[:] = g
+        mu_main[:] = mu
+    else:
+        s_field = np.asarray(compliance, dtype=float)
+        if s_field.shape != (6, 6, nz, ny, nx):
+            raise ValueError(f"compliance shape {s_field.shape} != {(6, 6, nz, ny, nx)}")
+        idx = 0
+        for iz in range(nz):
+            for iy in range(ny):
+                for ix in range(nx):
+                    lam, mu = _lame_from_compliance(s_field[:, :, iz, iy, ix])
+                    k, g = _kg_from_lame(lam, mu)
+                    k_vals[idx] = k
+                    g_vals[idx] = g
+                    mu_main[iz, iy, ix] = mu
+                    idx += 1
+
+    mu_xy = np.array(
+        [
+            0.25
+            * (
+                mu_main[iz, iy, ix]
+                + mu_main[iz, iy, ix + 1]
+                + mu_main[iz, iy + 1, ix]
+                + mu_main[iz, iy + 1, ix + 1]
+            )
+            for iz in range(nz)
+            for iy in range(ny - 1)
+            for ix in range(nx - 1)
+        ],
+        dtype=float,
+    )
+    mu_xz = np.array(
+        [
+            0.25
+            * (
+                mu_main[iz, iy, ix]
+                + mu_main[iz, iy, ix + 1]
+                + mu_main[iz + 1, iy, ix]
+                + mu_main[iz + 1, iy, ix + 1]
+            )
+            for iz in range(nz - 1)
+            for iy in range(ny)
+            for ix in range(nx - 1)
+        ],
+        dtype=float,
+    )
+    mu_yz = np.array(
+        [
+            0.25
+            * (
+                mu_main[iz, iy, ix]
+                + mu_main[iz, iy + 1, ix]
+                + mu_main[iz + 1, iy, ix]
+                + mu_main[iz + 1, iy + 1, ix]
+            )
+            for iz in range(nz - 1)
+            for iy in range(ny - 1)
+            for ix in range(nx)
+        ],
+        dtype=float,
+    )
+
+    n = layout.n_total
+    matrix = sp.lil_matrix((n, n), dtype=float)
+    sl = layout.slices()
+
+    def _put_diag(name: str, values: np.ndarray) -> None:
+        block = sl[name]
+        if values.size != block.stop - block.start:
+            raise ValueError(f"{name}: {values.size} values vs {block.stop - block.start} DOF")
+        idx = np.arange(block.start, block.stop)
+        matrix[idx, idx] = values
+
+    _put_diag("v_x", 1.0 / np.sqrt(np.maximum(rho_vx, 1e-30)))
+    _put_diag("v_y", 1.0 / np.sqrt(np.maximum(rho_vy, 1e-30)))
+    _put_diag("v_z", 1.0 / np.sqrt(np.maximum(rho_vz, 1e-30)))
+    _put_diag("sigma_xx", k_vals)
+    _put_diag("sigma_yy", k_vals)
+    _put_diag("sigma_zz", k_vals)
+    _put_diag("sigma_xy", np.sqrt(np.maximum(mu_xy, 0.0)))
+    _put_diag("sigma_xz", np.sqrt(np.maximum(mu_xz, 0.0)))
+    _put_diag("sigma_yz", np.sqrt(np.maximum(mu_yz, 0.0)))
+
+    sxx, syy, szz = sl["sigma_xx"], sl["sigma_yy"], sl["sigma_zz"]
+    g_mat = sp.diags(g_vals)
+    matrix[sxx, syy] = g_mat
+    matrix[sxx, szz] = g_mat
+    matrix[syy, sxx] = g_mat
+    matrix[syy, szz] = g_mat
+    matrix[szz, sxx] = g_mat
+    matrix[szz, syy] = g_mat
+    return matrix.tocsr()
+
+
+def paper_form_select_b_encoding(
+    nx: int,
+    ny: int,
+    nz: int,
+    *,
+    add_fractures: bool = True,
+    dx: float = 0.05,
+    eps: float = 1e-10,
+) -> dict[str, object]:
+    """
+    Specialized ``U_B`` as PREPARE/SELECT over the paper blocks of ``B^{-1/2}``.
+
+    ``SELECT`` terms: diagonal ``P_x,P_y,P_z,M_1,M_2,M_3`` plus a nested Pechan
+    block encoding of the non-diagonal Lamé block ``C_1^{1/2}``. Subnormalization
+    of the LCU is ``α_SELECT = Σ_ℓ α_ℓ``.
+    """
+    rho, compliance, mask = clinic_elastic_materials(
+        nx, ny, nz, add_fractures=add_fractures
+    )
+    layout = elastic_3d_layout(nx, ny, nz)
+    b_paper = assemble_paper_b_inv_sqrt(layout, rho, compliance)
+    b_dense = dense_matrix(b_paper)
+    sl = layout.slices()
+    n_idx = int(np.ceil(np.log2(max(layout.n_total, 2))))
+
+    diag_names = ("v_x", "v_y", "v_z", "sigma_xy", "sigma_xz", "sigma_yz")
+    paper_names = ("P_x", "P_y", "P_z", "M_1", "M_2", "M_3")
+    block_rows: list[dict[str, object]] = []
+    t_diag = 0
+    alpha_select = 0.0
+    diag_vec = np.real(b_dense.diagonal())
+    for name, paper_name in zip(diag_names, paper_names):
+        values = diag_vec[sl[name]]
+        alpha_ell = float(np.max(np.abs(values))) if values.size else 0.0
+        d_prime = len({float(np.round(v, 12)) for v in values})
+        t_ell = int(d_prime * t_count_controlled_rotation(n_idx, eps=eps))
+        t_diag += t_ell
+        alpha_select += alpha_ell
+        block_rows.append(
+            {
+                "block": paper_name,
+                "layout": name,
+                "kind": "diagonal",
+                "n_dof": int(sl[name].stop - sl[name].start),
+                "D_prime": d_prime,
+                "alpha": alpha_ell,
+                "t_select_arith": t_ell,
+            }
+        )
+
+    s0 = sl["sigma_xx"].start
+    s1 = sl["sigma_zz"].stop
+    c1_full = sp.lil_matrix(b_paper.shape, dtype=float)
+    c1_full[s0:s1, s0:s1] = b_paper[s0:s1, s0:s1]
+    c1_csr = c1_full.tocsr()
+    labeling_c1 = label_coefficients_by_block(c1_csr, layout, matrix_name="C1_sqrt")
+    oracle_c1 = build_hamiltonian_oracle_labeling(labeling_c1, c1_csr)
+    budget_c1 = explicit_hamiltonian_uh_t_budget(oracle_c1, eps=eps)
+    c1_rec = hamiltonian_from_oracles(oracle_c1)
+    c1_err = float(np.max(np.abs(c1_rec.real - dense_matrix(c1_csr))))
+    c1_dense = dense_matrix(b_paper[s0:s1, s0:s1])
+    alpha_c1 = float(spectral_scale(c1_dense)) if c1_dense.size else 0.0
+    alpha_select += alpha_c1
+    t_c1_arith = int(budget_c1["t_uh_arith_theory"])
+    t_c1_lookup = int(budget_c1["t_uh_one_query"])
+    block_rows.append(
+        {
+            "block": "C_1^{1/2}",
+            "layout": "sigma_xx/yy/zz",
+            "kind": "lame_3x3",
+            "n_dof": int(s1 - s0),
+            "D_prime": labeling_c1.d_prime,
+            "alpha": alpha_c1,
+            "t_select_arith": t_c1_arith,
+            "t_select_lookup": t_c1_lookup,
+            "oracle_recon_err": c1_err,
+            "offdiag_max": float(np.max(np.abs(c1_dense - np.diag(np.diag(c1_dense))))),
+        }
+    )
+
+    n_terms = 7
+    n_select = int(np.ceil(np.log2(n_terms)))
+    t_prepare = int(n_terms * t_count_controlled_rotation(n_select, eps=eps))
+    t_ub_arith = t_prepare + t_diag + t_c1_arith
+    t_ub_lookup = t_prepare + t_diag + t_c1_lookup
+
+    hamiltonian, a_matrix, *_rest, b_clinic = FD_solver_3D_elastic(
+        nx,
+        ny,
+        nz,
+        dx,
+        dx,
+        dx,
+        rho,
+        compliance,
+        {"L": "DBC", "R": "DBC", "T": "DBC", "B": "DBC", "F": "DBC", "Ba": "DBC"},
+    )
+    b_clinic_d = dense_matrix(b_clinic)
+    clinic_off = b_clinic_d.copy()
+    np.fill_diagonal(clinic_off, 0.0)
+    paper_off = b_dense.copy()
+    np.fill_diagonal(paper_off, 0.0)
+
+    return {
+        "layout": layout,
+        "B_paper": b_paper,
+        "B_clinic": b_clinic,
+        "A": a_matrix,
+        "H_clinic": hamiltonian,
+        "fracture_mask": mask,
+        "oracle_C1": oracle_c1,
+        "blocks": pd.DataFrame(block_rows),
+        "n_select_qubits": n_select,
+        "n_terms": n_terms,
+        "t_prepare": t_prepare,
+        "t_diag_blocks": t_diag,
+        "t_C1_arith": t_c1_arith,
+        "t_C1_lookup": t_c1_lookup,
+        "t_UB_select_arith": t_ub_arith,
+        "t_UB_select_lookup": t_ub_lookup,
+        "alpha_SELECT": float(alpha_select),
+        "alpha_C1": alpha_c1,
+        "C1_recon_err": c1_err,
+        "paper_offdiag_max": float(np.max(np.abs(paper_off))),
+        "clinic_offdiag_max": float(np.max(np.abs(clinic_off))),
+        "paper_vs_clinic_diag_max": float(
+            np.max(np.abs(np.diag(b_dense) - np.diag(b_clinic_d)))
+        ),
+        "eps": eps,
+    }
+
+
+def build_paper_select_b_circuit(
+    *,
+    n_index_qubits: int,
+    n_c1_ancilla: int,
+) -> QuantumCircuit:
+    """Opaque PREPARE/SELECT sketch: 7 paper blocks, nested ``U_{C_1}``."""
+    n_select = 3
+    total = n_select + n_c1_ancilla + n_index_qubits
+    circuit = QuantumCircuit(total, name="SELECT_B_paper")
+    sel = list(range(n_select))
+    c1_and_idx = list(range(n_select, total))
+    idx = list(range(n_select + n_c1_ancilla, total))
+    circuit.append(Gate("PREPARE", n_select, []), sel)
+    for label in ("U_Px", "U_Py", "U_Pz", "U_M1", "U_M2", "U_M3"):
+        circuit.append(Gate(label, n_index_qubits, []), idx)
+    circuit.append(Gate("U_C1", n_c1_ancilla + n_index_qubits, []), c1_and_idx)
+    circuit.append(Gate("PREPARE_dg", n_select, []), sel)
+    return circuit
+
+
 def build_factored_product_circuit(
     oracle_a: HamiltonianOracleLabeling,
     oracle_b: HamiltonianOracleLabeling,
@@ -3255,6 +3612,13 @@ def summarize_monolithic_vs_factored(
             evol_time=t_evol,
             qsvt_epsilon=qsvt_epsilon,
         )
+        spec = paper_form_select_b_encoding(
+            nx, ny, nz, add_fractures=add_fractures, dx=dx, eps=eps
+        )
+        cost_a = explicit_hamiltonian_uh_t_budget(packed["oracle_A"], eps=eps)
+        t_specialized = int(
+            2 * spec["t_UB_select_arith"] + int(cost_a["t_uh_arith_theory"])
+        )
         rows.append(
             {
                 "nx": nx,
@@ -3269,6 +3633,11 @@ def summarize_monolithic_vs_factored(
                 "alpha_factored": packed["alpha_factored"],
                 "evol_time": t_evol,
                 **costs,
+                "alpha_SELECT_B": spec["alpha_SELECT"],
+                "C1_offdiag_max": spec["paper_offdiag_max"],
+                "t_C1_arith": spec["t_C1_arith"],
+                "t_UB_select_arith": spec["t_UB_select_arith"],
+                "t_factored_specialized": t_specialized,
             }
         )
     return pd.DataFrame(rows)
@@ -3332,6 +3701,18 @@ def freeze_factored_vs_monolithic_writeup(
         use_imag=False,
         name="U_B",
     )
+    spec = paper_form_select_b_encoding(
+        nx, ny, nz, add_fractures=add_fractures, dx=dx, eps=eps
+    )
+    cost_a = explicit_hamiltonian_uh_t_budget(packed["oracle_A"], eps=eps)
+    t_specialized = int(
+        2 * spec["t_UB_select_arith"] + int(cost_a["t_uh_arith_theory"])
+    )
+    spec_winner = (
+        "factored_specialized"
+        if t_specialized < int(costs["t_H_arith"])
+        else "monolithic"
+    )
 
     md = "\n".join(
         [
@@ -3364,12 +3745,21 @@ def freeze_factored_vs_monolithic_writeup(
             f"- Arithmetic-index `T`: monolithic `{costs['t_H_arith']}` vs "
             f"factored Pechan `{costs['t_factored_arith']}` "
             f"(winner: **{costs['winner_arith']}**).",
+            f"- Specialized paper SELECT `U_B`: nested Pechan of non-diagonal "
+            f"`C_1^{{1/2}}` plus diagonal `P_x,P_y,P_z,M_i`. "
+            f"`α_SELECT={spec['alpha_SELECT']:.6g}`, "
+            f"`||G||_max={spec['paper_offdiag_max']:.6g}`, "
+            f"`t_C1_arith={spec['t_C1_arith']}`, "
+            f"`t_UB_select_arith={spec['t_UB_select_arith']}`, "
+            f"`t_factored_specialized={t_specialized}` "
+            f"(winner vs mono arith: **{spec_winner}**).",
             "",
-            "**Takeaway.** Compare only monolithic Pechan `U_H` vs factored "
-            "Pechan `U_B U_A U_B`. Monolithic usually wins the *lookup* ledger; "
-            "factored Pechan can win arithmetic `T`, but `κ` and `C_amp_ratio` "
-            "≫ 1 mean amplitude amplification / QSVT overhead likely spoils any "
-            "speedup from separate encodings on clinic elastic grids.",
+            "**Takeaway.** Monolithic Pechan `U_H` vs factored Pechan "
+            "`U_B U_A U_B` vs paper-form SELECT `U_B` (nested `C_1^{1/2}`). "
+            "Monolithic usually wins lookup; factored Pechan can win arithmetic "
+            "`T`. Specialized SELECT is the physically correct `U_B` because "
+            "`C_1^{1/2}` is not diagonal. `κ` and `C_amp_ratio` ≫ 1 still mean "
+            "AA / QSVT overhead can dominate any oracle-`T` savings.",
         ]
     )
 
@@ -3392,5 +3782,11 @@ def freeze_factored_vs_monolithic_writeup(
             "alpha_factored": packed["alpha_factored"],
             "evol_time": t_evol,
             **costs,
+            "alpha_SELECT_B": spec["alpha_SELECT"],
+            "C1_offdiag_max": spec["paper_offdiag_max"],
+            "t_C1_arith": spec["t_C1_arith"],
+            "t_UB_select_arith": spec["t_UB_select_arith"],
+            "t_factored_specialized": t_specialized,
+            "winner_specialized": spec_winner,
         },
     }
