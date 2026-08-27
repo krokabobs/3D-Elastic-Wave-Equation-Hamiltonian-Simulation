@@ -3106,13 +3106,13 @@ def _kg_from_lame(lam: float, mu: float) -> tuple[float, float]:
     return (s1 + 2.0 * s2) / 3.0, (s1 - s2) / 3.0
 
 
-def assemble_paper_b_inv_sqrt(
+def assemble_emmas_b_inv_sqrt(
     layout: Elastic3DLayout,
     rho_model: np.ndarray,
     compliance: np.ndarray,
 ) -> sp.csr_matrix:
     """
-    Paper-form ``B^{-1/2}`` (``apssamp.tex`` / Eq. of ``B^{-1/2}``).
+    Emma's-form ``B^{-1/2}`` (``apssamp.tex`` / Eq. of ``B^{-1/2}``).
 
     Block diagonal with diagonal ``P_x,P_y,P_z``, the non-diagonal Lamé
     ``C_1^{1/2}`` (``K`` on the diagonal, ``G`` off-diagonal among
@@ -3120,7 +3120,7 @@ def assemble_paper_b_inv_sqrt(
 
     Clinic ``FD_solver_3D_elastic`` instead takes ``√S_{ii}`` independently,
     so its ``B^{-1/2}`` is strictly diagonal. This constructor restores the
-    paper coupling in the middle block.
+    Emma's coupling in the middle block.
     """
     nx, ny, nz = layout.nx, layout.ny, layout.nz
     rho = np.asarray(rho_model, dtype=float)
@@ -3235,7 +3235,7 @@ def assemble_paper_b_inv_sqrt(
     return matrix.tocsr()
 
 
-def paper_form_select_b_encoding(
+def emmas_form_select_b_encoding(
     nx: int,
     ny: int,
     nz: int,
@@ -3245,7 +3245,7 @@ def paper_form_select_b_encoding(
     eps: float = 1e-10,
 ) -> dict[str, object]:
     """
-    Specialized ``U_B`` as PREPARE/SELECT over the paper blocks of ``B^{-1/2}``.
+    Specialized ``U_B`` as PREPARE/SELECT over Emma's blocks of ``B^{-1/2}``.
 
     ``SELECT`` terms: diagonal ``P_x,P_y,P_z,M_1,M_2,M_3`` plus a nested Pechan
     block encoding of the non-diagonal Lamé block ``C_1^{1/2}``. Subnormalization
@@ -3255,18 +3255,18 @@ def paper_form_select_b_encoding(
         nx, ny, nz, add_fractures=add_fractures
     )
     layout = elastic_3d_layout(nx, ny, nz)
-    b_paper = assemble_paper_b_inv_sqrt(layout, rho, compliance)
-    b_dense = dense_matrix(b_paper)
+    b_emmas = assemble_emmas_b_inv_sqrt(layout, rho, compliance)
+    b_dense = dense_matrix(b_emmas)
     sl = layout.slices()
     n_idx = int(np.ceil(np.log2(max(layout.n_total, 2))))
 
     diag_names = ("v_x", "v_y", "v_z", "sigma_xy", "sigma_xz", "sigma_yz")
-    paper_names = ("P_x", "P_y", "P_z", "M_1", "M_2", "M_3")
+    emmas_names = ("P_x", "P_y", "P_z", "M_1", "M_2", "M_3")
     block_rows: list[dict[str, object]] = []
     t_diag = 0
     alpha_select = 0.0
     diag_vec = np.real(b_dense.diagonal())
-    for name, paper_name in zip(diag_names, paper_names):
+    for name, emmas_name in zip(diag_names, emmas_names):
         values = diag_vec[sl[name]]
         alpha_ell = float(np.max(np.abs(values))) if values.size else 0.0
         d_prime = len({float(np.round(v, 12)) for v in values})
@@ -3275,7 +3275,7 @@ def paper_form_select_b_encoding(
         alpha_select += alpha_ell
         block_rows.append(
             {
-                "block": paper_name,
+                "block": emmas_name,
                 "layout": name,
                 "kind": "diagonal",
                 "n_dof": int(sl[name].stop - sl[name].start),
@@ -3287,15 +3287,15 @@ def paper_form_select_b_encoding(
 
     s0 = sl["sigma_xx"].start
     s1 = sl["sigma_zz"].stop
-    c1_full = sp.lil_matrix(b_paper.shape, dtype=float)
-    c1_full[s0:s1, s0:s1] = b_paper[s0:s1, s0:s1]
+    c1_full = sp.lil_matrix(b_emmas.shape, dtype=float)
+    c1_full[s0:s1, s0:s1] = b_emmas[s0:s1, s0:s1]
     c1_csr = c1_full.tocsr()
     labeling_c1 = label_coefficients_by_block(c1_csr, layout, matrix_name="C1_sqrt")
     oracle_c1 = build_hamiltonian_oracle_labeling(labeling_c1, c1_csr)
     budget_c1 = explicit_hamiltonian_uh_t_budget(oracle_c1, eps=eps)
     c1_rec = hamiltonian_from_oracles(oracle_c1)
     c1_err = float(np.max(np.abs(c1_rec.real - dense_matrix(c1_csr))))
-    c1_dense = dense_matrix(b_paper[s0:s1, s0:s1])
+    c1_dense = dense_matrix(b_emmas[s0:s1, s0:s1])
     alpha_c1 = float(spectral_scale(c1_dense)) if c1_dense.size else 0.0
     alpha_select += alpha_c1
     t_c1_arith = int(budget_c1["t_uh_arith_theory"])
@@ -3335,12 +3335,12 @@ def paper_form_select_b_encoding(
     b_clinic_d = dense_matrix(b_clinic)
     clinic_off = b_clinic_d.copy()
     np.fill_diagonal(clinic_off, 0.0)
-    paper_off = b_dense.copy()
-    np.fill_diagonal(paper_off, 0.0)
+    emmas_off = b_dense.copy()
+    np.fill_diagonal(emmas_off, 0.0)
 
     return {
         "layout": layout,
-        "B_paper": b_paper,
+        "B_emmas": b_emmas,
         "B_clinic": b_clinic,
         "A": a_matrix,
         "H_clinic": hamiltonian,
@@ -3358,24 +3358,24 @@ def paper_form_select_b_encoding(
         "alpha_SELECT": float(alpha_select),
         "alpha_C1": alpha_c1,
         "C1_recon_err": c1_err,
-        "paper_offdiag_max": float(np.max(np.abs(paper_off))),
+        "emmas_offdiag_max": float(np.max(np.abs(emmas_off))),
         "clinic_offdiag_max": float(np.max(np.abs(clinic_off))),
-        "paper_vs_clinic_diag_max": float(
+        "emmas_vs_clinic_diag_max": float(
             np.max(np.abs(np.diag(b_dense) - np.diag(b_clinic_d)))
         ),
         "eps": eps,
     }
 
 
-def build_paper_select_b_circuit(
+def build_emmas_select_b_circuit(
     *,
     n_index_qubits: int,
     n_c1_ancilla: int,
 ) -> QuantumCircuit:
-    """Opaque PREPARE/SELECT sketch: 7 paper blocks, nested ``U_{C_1}``."""
+    """Opaque PREPARE/SELECT sketch: 7 Emma's blocks, nested ``U_{C_1}``."""
     n_select = 3
     total = n_select + n_c1_ancilla + n_index_qubits
-    circuit = QuantumCircuit(total, name="SELECT_B_paper")
+    circuit = QuantumCircuit(total, name="SELECT_B_emmas")
     sel = list(range(n_select))
     c1_and_idx = list(range(n_select, total))
     idx = list(range(n_select + n_c1_ancilla, total))
@@ -3383,6 +3383,189 @@ def build_paper_select_b_circuit(
     for label in ("U_Px", "U_Py", "U_Pz", "U_M1", "U_M2", "U_M3"):
         circuit.append(Gate(label, n_index_qubits, []), idx)
     circuit.append(Gate("U_C1", n_c1_ancilla + n_index_qubits, []), c1_and_idx)
+    circuit.append(Gate("PREPARE_dg", n_select, []), sel)
+    return circuit
+
+
+def _emmas_block_submatrix(
+    b_emmas: sp.spmatrix,
+    layout: Elastic3DLayout,
+    names: tuple[str, ...],
+) -> sp.csr_matrix:
+    """Embed selected layout slices of Emma's ``B^{-1/2}`` into a full ``N_s×N_s`` matrix."""
+    sl = layout.slices()
+    out = sp.lil_matrix(b_emmas.shape, dtype=float)
+    for name in names:
+        block = sl[name]
+        out[block, block] = b_emmas[block, block]
+    return out.tocsr()
+
+
+def emmas_form_three_block_select_b_encoding(
+    nx: int,
+    ny: int,
+    nz: int,
+    *,
+    add_fractures: bool = True,
+    dx: float = 0.05,
+    eps: float = 1e-10,
+) -> dict[str, object]:
+    """
+    Emma's / Methods-aligned specialized ``U_B``: PREPARE/SELECT over **three**
+    blocks of Emma's ``B^{-1/2}``:
+
+    * ``B_1 = diag(P_x,P_y,P_z)`` — diagonal (Pechan/SELECT value loading);
+    * ``B_2 = C_1^{1/2}`` — nested Pechan for the non-diagonal Lamé block;
+    * ``B_3 = diag(M_1,M_2,M_3)`` — diagonal shear blocks.
+
+    Reports Nguyen-style shared scale ``α_max = max_ℓ α_ℓ`` and LCU sum
+    ``α_sum = Σ_ℓ α_ℓ`` (the latter matches the 7-term SELECT ledger).
+    """
+    rho, compliance, mask = clinic_elastic_materials(
+        nx, ny, nz, add_fractures=add_fractures
+    )
+    layout = elastic_3d_layout(nx, ny, nz)
+    b_emmas = assemble_emmas_b_inv_sqrt(layout, rho, compliance)
+    sl = layout.slices()
+    n_idx = int(np.ceil(np.log2(max(layout.n_total, 2))))
+
+    # --- B1: velocity densities (diagonal) ---
+    b1 = _emmas_block_submatrix(b_emmas, layout, ("v_x", "v_y", "v_z"))
+    labeling_b1 = label_coefficients_by_block(b1, layout, matrix_name="B1")
+    oracle_b1 = build_hamiltonian_oracle_labeling(labeling_b1, b1)
+    budget_b1 = explicit_diagonal_be_t_budget(oracle_b1, eps=eps)
+    alpha_b1 = float(spectral_scale(dense_matrix(b1)))
+    t_b1_arith = int(budget_b1["t_select_arith_theory"])
+    t_b1_lookup = int(budget_b1["t_uh_one_query"])
+
+    # --- B2: Lamé C_1^{1/2} (nested Pechan) ---
+    s0 = sl["sigma_xx"].start
+    s1 = sl["sigma_zz"].stop
+    b2_full = sp.lil_matrix(b_emmas.shape, dtype=float)
+    b2_full[s0:s1, s0:s1] = b_emmas[s0:s1, s0:s1]
+    b2 = b2_full.tocsr()
+    labeling_b2 = label_coefficients_by_block(b2, layout, matrix_name="B2_C1")
+    oracle_b2 = build_hamiltonian_oracle_labeling(labeling_b2, b2)
+    budget_b2 = explicit_hamiltonian_uh_t_budget(oracle_b2, eps=eps)
+    b2_dense = dense_matrix(b_emmas[s0:s1, s0:s1])
+    alpha_b2 = float(spectral_scale(b2_dense)) if b2_dense.size else 0.0
+    t_b2_arith = int(budget_b2["t_uh_arith_theory"])
+    t_b2_lookup = int(budget_b2["t_uh_one_query"])
+    b2_recon = hamiltonian_from_oracles(oracle_b2)
+    b2_err = float(np.max(np.abs(b2_recon.real - dense_matrix(b2))))
+
+    # --- B3: shear moduli (diagonal) ---
+    b3 = _emmas_block_submatrix(
+        b_emmas, layout, ("sigma_xy", "sigma_xz", "sigma_yz")
+    )
+    labeling_b3 = label_coefficients_by_block(b3, layout, matrix_name="B3")
+    oracle_b3 = build_hamiltonian_oracle_labeling(labeling_b3, b3)
+    budget_b3 = explicit_diagonal_be_t_budget(oracle_b3, eps=eps)
+    alpha_b3 = float(spectral_scale(dense_matrix(b3)))
+    t_b3_arith = int(budget_b3["t_select_arith_theory"])
+    t_b3_lookup = int(budget_b3["t_uh_one_query"])
+
+    n_terms = 3
+    n_select = int(np.ceil(np.log2(n_terms)))  # 2 qubits
+    t_prepare = int(n_terms * t_count_controlled_rotation(n_select, eps=eps))
+    t_ub_arith = t_prepare + t_b1_arith + t_b2_arith + t_b3_arith
+    t_ub_lookup = t_prepare + t_b1_lookup + t_b2_lookup + t_b3_lookup
+
+    alpha_max = float(max(alpha_b1, alpha_b2, alpha_b3))
+    alpha_sum = float(alpha_b1 + alpha_b2 + alpha_b3)
+
+    block_rows = pd.DataFrame(
+        [
+            {
+                "block": "B_1",
+                "pieces": "P_x,P_y,P_z",
+                "kind": "diagonal",
+                "n_dof": int(
+                    (sl["v_z"].stop - sl["v_x"].start)
+                ),
+                "D_prime": labeling_b1.d_prime,
+                "alpha": alpha_b1,
+                "t_select_arith": t_b1_arith,
+                "t_select_lookup": t_b1_lookup,
+            },
+            {
+                "block": "B_2",
+                "pieces": "C_1^{1/2}",
+                "kind": "lame_3x3",
+                "n_dof": int(s1 - s0),
+                "D_prime": labeling_b2.d_prime,
+                "alpha": alpha_b2,
+                "t_select_arith": t_b2_arith,
+                "t_select_lookup": t_b2_lookup,
+                "oracle_recon_err": b2_err,
+                "offdiag_max": float(
+                    np.max(np.abs(b2_dense - np.diag(np.diag(b2_dense))))
+                ),
+            },
+            {
+                "block": "B_3",
+                "pieces": "M_1,M_2,M_3",
+                "kind": "diagonal",
+                "n_dof": int(
+                    (sl["sigma_yz"].stop - sl["sigma_xy"].start)
+                ),
+                "D_prime": labeling_b3.d_prime,
+                "alpha": alpha_b3,
+                "t_select_arith": t_b3_arith,
+                "t_select_lookup": t_b3_lookup,
+            },
+        ]
+    )
+
+    return {
+        "layout": layout,
+        "B_emmas": b_emmas,
+        "fracture_mask": mask,
+        "oracle_B1": oracle_b1,
+        "oracle_B2": oracle_b2,
+        "oracle_B3": oracle_b3,
+        "blocks": block_rows,
+        "n_select_qubits": n_select,
+        "n_terms": n_terms,
+        "t_prepare": t_prepare,
+        "t_B1_arith": t_b1_arith,
+        "t_B2_arith": t_b2_arith,
+        "t_B3_arith": t_b3_arith,
+        "t_B1_lookup": t_b1_lookup,
+        "t_B2_lookup": t_b2_lookup,
+        "t_B3_lookup": t_b3_lookup,
+        "t_UB_3block_arith": t_ub_arith,
+        "t_UB_3block_lookup": t_ub_lookup,
+        "alpha_B1": alpha_b1,
+        "alpha_B2": alpha_b2,
+        "alpha_B3": alpha_b3,
+        "alpha_SELECT_max": alpha_max,
+        "alpha_SELECT_sum": alpha_sum,
+        "B2_recon_err": b2_err,
+        "emmas_offdiag_max": float(
+            np.max(np.abs(b2_dense - np.diag(np.diag(b2_dense))))
+        ),
+        "n_index_qubits": n_idx,
+        "eps": eps,
+    }
+
+
+def build_emmas_three_block_select_b_circuit(
+    *,
+    n_index_qubits: int,
+    n_b2_ancilla: int,
+) -> QuantumCircuit:
+    """Opaque PREPARE/SELECT sketch: Emma's three blocks ``U_1,U_2,U_3``."""
+    n_select = 2
+    total = n_select + n_b2_ancilla + n_index_qubits
+    circuit = QuantumCircuit(total, name="SELECT_B_emmas_3block")
+    sel = list(range(n_select))
+    b2_and_idx = list(range(n_select, total))
+    idx = list(range(n_select + n_b2_ancilla, total))
+    circuit.append(Gate("PREPARE", n_select, []), sel)
+    circuit.append(Gate("U_B1", n_index_qubits, []), idx)
+    circuit.append(Gate("U_B2", n_b2_ancilla + n_index_qubits, []), b2_and_idx)
+    circuit.append(Gate("U_B3", n_index_qubits, []), idx)
     circuit.append(Gate("PREPARE_dg", n_select, []), sel)
     return circuit
 
@@ -3612,13 +3795,31 @@ def summarize_monolithic_vs_factored(
             evol_time=t_evol,
             qsvt_epsilon=qsvt_epsilon,
         )
-        spec = paper_form_select_b_encoding(
+        spec = emmas_form_select_b_encoding(
+            nx, ny, nz, add_fractures=add_fractures, dx=dx, eps=eps
+        )
+        spec3 = emmas_form_three_block_select_b_encoding(
             nx, ny, nz, add_fractures=add_fractures, dx=dx, eps=eps
         )
         cost_a = explicit_hamiltonian_uh_t_budget(packed["oracle_A"], eps=eps)
-        t_specialized = int(
-            2 * spec["t_UB_select_arith"] + int(cost_a["t_uh_arith_theory"])
+        t_ua = int(cost_a["t_uh_arith_theory"])
+        t_specialized = int(2 * spec["t_UB_select_arith"] + t_ua)
+        t_3block = int(2 * spec3["t_UB_3block_arith"] + t_ua)
+        # Emma's-form factored α using SELECT sum (LCU) vs Nguyen max.
+        alpha_fact_7 = float(packed["alpha_A"] * (spec["alpha_SELECT"] ** 2))
+        alpha_fact_3_sum = float(
+            packed["alpha_A"] * (spec3["alpha_SELECT_sum"] ** 2)
         )
+        alpha_fact_3_max = float(
+            packed["alpha_A"] * (spec3["alpha_SELECT_max"] ** 2)
+        )
+        winners = {
+            "monolithic": int(costs["t_H_arith"]),
+            "factored_pechan": int(costs["t_factored_arith"]),
+            "factored_7select": t_specialized,
+            "factored_3block": t_3block,
+        }
+        winner_all = min(winners, key=winners.get)
         rows.append(
             {
                 "nx": nx,
@@ -3634,10 +3835,24 @@ def summarize_monolithic_vs_factored(
                 "evol_time": t_evol,
                 **costs,
                 "alpha_SELECT_B": spec["alpha_SELECT"],
-                "C1_offdiag_max": spec["paper_offdiag_max"],
+                "C1_offdiag_max": spec["emmas_offdiag_max"],
                 "t_C1_arith": spec["t_C1_arith"],
                 "t_UB_select_arith": spec["t_UB_select_arith"],
                 "t_factored_specialized": t_specialized,
+                "alpha_SELECT_3_max": spec3["alpha_SELECT_max"],
+                "alpha_SELECT_3_sum": spec3["alpha_SELECT_sum"],
+                "t_B1_arith": spec3["t_B1_arith"],
+                "t_B2_arith": spec3["t_B2_arith"],
+                "t_B3_arith": spec3["t_B3_arith"],
+                "t_UB_3block_arith": spec3["t_UB_3block_arith"],
+                "t_factored_3block": t_3block,
+                "alpha_factored_7select": alpha_fact_7,
+                "alpha_factored_3block_sum": alpha_fact_3_sum,
+                "alpha_factored_3block_max": alpha_fact_3_max,
+                "kappa_3block_sum": (
+                    alpha_fact_3_sum / alpha_h if alpha_h > 0 else float("nan")
+                ),
+                "winner_arith_all": winner_all,
             }
         )
     return pd.DataFrame(rows)
@@ -3701,31 +3916,53 @@ def freeze_factored_vs_monolithic_writeup(
         use_imag=False,
         name="U_B",
     )
-    spec = paper_form_select_b_encoding(
+    spec = emmas_form_select_b_encoding(
+        nx, ny, nz, add_fractures=add_fractures, dx=dx, eps=eps
+    )
+    spec3 = emmas_form_three_block_select_b_encoding(
         nx, ny, nz, add_fractures=add_fractures, dx=dx, eps=eps
     )
     cost_a = explicit_hamiltonian_uh_t_budget(packed["oracle_A"], eps=eps)
-    t_specialized = int(
-        2 * spec["t_UB_select_arith"] + int(cost_a["t_uh_arith_theory"])
-    )
+    t_ua = int(cost_a["t_uh_arith_theory"])
+    t_specialized = int(2 * spec["t_UB_select_arith"] + t_ua)
+    t_3block = int(2 * spec3["t_UB_3block_arith"] + t_ua)
+    t_mono = int(costs["t_H_arith"])
+    t_pechan = int(costs["t_factored_arith"])
+    winners = {
+        "monolithic": t_mono,
+        "factored_pechan": t_pechan,
+        "factored_7select": t_specialized,
+        "factored_3block": t_3block,
+    }
+    winner_all = min(winners, key=winners.get)
     spec_winner = (
         "factored_specialized"
-        if t_specialized < int(costs["t_H_arith"])
+        if t_specialized < t_mono
         else "monolithic"
     )
+    winner_3 = "factored_3block" if t_3block < t_mono else "monolithic"
+    alpha_fact_3_sum = float(
+        packed["alpha_A"] * (spec3["alpha_SELECT_sum"] ** 2)
+    )
+    alpha_fact_3_max = float(
+        packed["alpha_A"] * (spec3["alpha_SELECT_max"] ** 2)
+    )
+    kappa_3_sum = alpha_fact_3_sum / alpha_h if alpha_h > 0 else float("nan")
 
     md = "\n".join(
         [
-            r"### Frozen comparison: monolithic $U_H$ vs factored $U_B U_A U_B$",
+            r"### Frozen comparison: monolithic $U_H$ vs factored variants",
             "",
             f"- Grid: `{nx}×{ny}×{nz}` (`N_s={demo['layout'].n_total}`), "
             f"fractures=`{add_fractures}`.",
             f"- Classical product check: "
             f"`||B^{{-1/2}} (iA) B^{{-1/2}} - H||_max = {packed['product_err']:.3e}` "
             f"(oracle-assembled product err `{packed['product_err_oracle']:.3e}`).",
-            f"- Scales: `||H||_2` = `{alpha_h:.6g}`; factored `α_B² α_A = {packed['alpha_factored']:.6g}` "
+            f"- Scales: `||H||_2` = `{alpha_h:.6g}`; clinic factored "
+            f"`α_B² α_A = {packed['alpha_factored']:.6g}` "
             f"(α_A={packed['alpha_A']:.6g}, α_B={packed['alpha_B']:.6g}).",
-            f"- Subnormalization inflation: `κ = α_factored/||H||_2 = {costs.get('kappa', float('nan')):.6g}` "
+            f"- Subnormalization inflation (clinic Pechan): "
+            f"`κ = {costs.get('kappa', float('nan')):.6g}` "
             f"(log₂ κ = {costs.get('log2_kappa', float('nan')):.2f}).",
             (
                 f"- Amplification ledger (t={t_evol:.3g}, ε={qsvt_epsilon}): "
@@ -3742,24 +3979,30 @@ def freeze_factored_vs_monolithic_writeup(
             f"- Lookup `T` (one query): monolithic `{costs['t_H_lookup']}` vs "
             f"factored Pechan `{costs['t_factored_lookup']}` "
             f"(winner: **{costs['winner_lookup']}**).",
-            f"- Arithmetic-index `T`: monolithic `{costs['t_H_arith']}` vs "
-            f"factored Pechan `{costs['t_factored_arith']}` "
+            f"- Arithmetic-index `T`: monolithic `{t_mono}` vs "
+            f"factored Pechan `{t_pechan}` "
             f"(winner: **{costs['winner_arith']}**).",
-            f"- Specialized paper SELECT `U_B`: nested Pechan of non-diagonal "
-            f"`C_1^{{1/2}}` plus diagonal `P_x,P_y,P_z,M_i`. "
+            f"- **7-term SELECT** `U_B` (`P_x,P_y,P_z,C_1,M_i`): "
             f"`α_SELECT={spec['alpha_SELECT']:.6g}`, "
-            f"`||G||_max={spec['paper_offdiag_max']:.6g}`, "
-            f"`t_C1_arith={spec['t_C1_arith']}`, "
             f"`t_UB_select_arith={spec['t_UB_select_arith']}`, "
-            f"`t_factored_specialized={t_specialized}` "
-            f"(winner vs mono arith: **{spec_winner}**).",
+            f"`t_factored_7select={t_specialized}` "
+            f"(vs mono: **{spec_winner}**).",
+            f"- **Emma's 3-block SELECT** `U_B` (`B_1,B_2,B_3`): "
+            f"`α_max={spec3['alpha_SELECT_max']:.6g}`, "
+            f"`α_sum={spec3['alpha_SELECT_sum']:.6g}`, "
+            f"`t_B1/B2/B3={spec3['t_B1_arith']}/{spec3['t_B2_arith']}/{spec3['t_B3_arith']}`, "
+            f"`t_UB_3block_arith={spec3['t_UB_3block_arith']}`, "
+            f"`t_factored_3block={t_3block}` "
+            f"(vs mono: **{winner_3}**).",
+            f"- Emma's-factored κ (3-block, LCU sum): "
+            f"`κ_3 = α_A α_sum² / ||H||_2 = {kappa_3_sum:.6g}` "
+            f"(Nguyen-max path α_fact=`{alpha_fact_3_max:.6g}`).",
+            f"- **Oracle-`T` winner among all four:** **{winner_all}**.",
             "",
-            "**Takeaway.** Monolithic Pechan `U_H` vs factored Pechan "
-            "`U_B U_A U_B` vs paper-form SELECT `U_B` (nested `C_1^{1/2}`). "
-            "Monolithic usually wins lookup; factored Pechan can win arithmetic "
-            "`T`. Specialized SELECT is the physically correct `U_B` because "
-            "`C_1^{1/2}` is not diagonal. `κ` and `C_amp_ratio` ≫ 1 still mean "
-            "AA / QSVT overhead can dominate any oracle-`T` savings.",
+            "**Takeaway.** Compare (1) monolithic Pechan `U_H`, (2) clinic "
+            "factored Pechan, (3) 7-term SELECT, (4) Emma's 3-block SELECT. "
+            "Emma's 3-block grouping matches Methods; 7-term is a finer split of the same "
+            "matrix. `κ` / `C_amp_ratio` ≫ 1 still dominate any oracle-`T` savings.",
         ]
     )
 
@@ -3771,6 +4014,8 @@ def freeze_factored_vs_monolithic_writeup(
         "circuit_B": circ_b,
         "alpha_factored": alpha,
         "meta": meta,
+        "spec7": spec,
+        "spec3": spec3,
         "markdown": md,
         "row": {
             "nx": nx,
@@ -3783,10 +4028,20 @@ def freeze_factored_vs_monolithic_writeup(
             "evol_time": t_evol,
             **costs,
             "alpha_SELECT_B": spec["alpha_SELECT"],
-            "C1_offdiag_max": spec["paper_offdiag_max"],
+            "C1_offdiag_max": spec["emmas_offdiag_max"],
             "t_C1_arith": spec["t_C1_arith"],
             "t_UB_select_arith": spec["t_UB_select_arith"],
             "t_factored_specialized": t_specialized,
             "winner_specialized": spec_winner,
+            "alpha_SELECT_3_max": spec3["alpha_SELECT_max"],
+            "alpha_SELECT_3_sum": spec3["alpha_SELECT_sum"],
+            "t_B1_arith": spec3["t_B1_arith"],
+            "t_B2_arith": spec3["t_B2_arith"],
+            "t_B3_arith": spec3["t_B3_arith"],
+            "t_UB_3block_arith": spec3["t_UB_3block_arith"],
+            "t_factored_3block": t_3block,
+            "kappa_3block_sum": kappa_3_sum,
+            "winner_3block": winner_3,
+            "winner_arith_all": winner_all,
         },
     }
