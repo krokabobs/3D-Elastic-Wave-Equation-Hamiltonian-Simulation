@@ -79,11 +79,12 @@ def transpiled_gate_counts(
     sk_recursion_degree: int = 2,
     sk_t_count: bool = True,
 ) -> dict[str, int | dict[str, int]]:
-    """Depth, size, and T-gate count after Qiskit transpilation (+ optional SK on rotations)."""
+    """Depth, size, T, and CNOT counts after Qiskit transpilation (+ optional SK)."""
     transpiled = transpile(circuit, optimization_level=optimization_level)
     ops = dict(transpiled.count_ops())
     two_qubit_names = {"cx", "cz", "cy", "ch", "swap", "ecr"}
     two_qubit_gates = sum(ops.get(name, 0) for name in two_qubit_names)
+    cnot_gates = int(ops.get("cx", 0))
     if sk_t_count:
         t_gates = count_t_gates(
             circuit,
@@ -97,6 +98,7 @@ def transpiled_gate_counts(
         "depth": transpiled.depth(),
         "size": transpiled.size(),
         "t_gates": t_gates,
+        "cnot_gates": cnot_gates,
         "two_qubit_gates": two_qubit_gates,
         "ops": ops,
     }
@@ -158,11 +160,12 @@ def apply_multiplexed_ry(
 
 
 # ---------------------------------------------------------------------------
-# Explicit (analytic) T-counts — no Solovay–Kitaev
+# Explicit (analytic) T / CNOT counts — no Solovay–Kitaev
 # ---------------------------------------------------------------------------
 
-# Exact Clifford+T Toffoli (standard 7-T construction).
+# Exact Clifford+T Toffoli (standard 7-T / 6-CNOT construction).
 T_PER_TOFFOLI = 7
+CNOT_PER_TOFFOLI = 6
 
 
 def t_count_mcx(n_controls: int) -> int:
@@ -183,6 +186,23 @@ def t_count_mcx(n_controls: int) -> int:
     return int(2 * (n - 1) * T_PER_TOFFOLI)
 
 
+def cnot_count_mcx(n_controls: int) -> int:
+    """
+    Explicit CNOT count for an ``n``-controlled NOT (MCX).
+
+    Same Barenco dirty-ancilla cascade as :func:`t_count_mcx`:
+      * ``n <= 0``: 0
+      * ``n == 1``: one ``CX`` → 1 CNOT
+      * ``n >= 2``: ``2(n-1)`` Toffolis × 6 CNOT each (Clifford+T Toffoli)
+    """
+    n = int(n_controls)
+    if n <= 0:
+        return 0
+    if n == 1:
+        return 1
+    return int(2 * (n - 1) * CNOT_PER_TOFFOLI)
+
+
 def t_count_rotation(eps: float = 1e-10) -> int:
     """
     Approximate ``T`` cost of one arbitrary-angle single-qubit rotation.
@@ -196,6 +216,18 @@ def t_count_rotation(eps: float = 1e-10) -> int:
     return max(1, int(np.ceil(3.0 * np.log2(1.0 / float(eps)))))
 
 
+def cnot_count_rotation(eps: float = 1e-10) -> int:
+    """
+    CNOT cost of one single-qubit angle synthesis.
+
+    Ross–Selinger / SK-type synthesis is a single-qubit Clifford+``T`` sequence,
+    so the CNOT count is 0 (counterpart to :func:`t_count_rotation`).
+    """
+    # Validate eps the same way as the T ledger.
+    t_count_rotation(eps)
+    return 0
+
+
 def t_count_controlled_rotation(n_controls: int, *, eps: float = 1e-10) -> int:
     """
     Explicit ``T`` for one ``C^{n}(R_y)``: one MCX ledger + one angle synthesis.
@@ -206,6 +238,11 @@ def t_count_controlled_rotation(n_controls: int, *, eps: float = 1e-10) -> int:
     return t_count_mcx(n_controls) + t_count_rotation(eps)
 
 
+def cnot_count_controlled_rotation(n_controls: int, *, eps: float = 1e-10) -> int:
+    """Explicit CNOT for one ``C^{n}(R_y)``: MCX CNOTs + single-qubit synthesis (0)."""
+    return cnot_count_mcx(n_controls) + cnot_count_rotation(eps)
+
+
 def explicit_odata_t_count(
     d_prime: int,
     n_value_qubits: int,
@@ -213,7 +250,7 @@ def explicit_odata_t_count(
     eps: float = 1e-10,
 ) -> dict[str, int]:
     """
-    Analytic ``T`` budget for multiplexed ``O_data`` (no SK, no transpile).
+    Analytic ``T`` / CNOT budget for multiplexed ``O_data`` (no SK, no transpile).
 
     Circuit shape in :func:`data_loading_subcircuit`:
       * 1 unrestricted ``R_y``
@@ -224,14 +261,20 @@ def explicit_odata_t_count(
     if d_prime < 1:
         raise ValueError("d_prime must be >= 1")
     t_ry = t_count_rotation(eps)
+    cnot_ry = cnot_count_rotation(eps)
     n_controlled = max(d_prime - 1, 0)
     t_controlled = n_controlled * t_count_controlled_rotation(n_value_qubits, eps=eps)
+    cnot_controlled = n_controlled * cnot_count_controlled_rotation(
+        n_value_qubits, eps=eps
+    )
     return {
         "n_ry": 1,
         "n_controlled_ry": n_controlled,
         "n_value_qubits": n_value_qubits,
         "t_per_rotation": t_ry,
+        "cnot_per_rotation": cnot_ry,
         "t_odata": int(t_ry + t_controlled),
+        "cnot_odata": int(cnot_ry + cnot_controlled),
     }
 
 
@@ -258,3 +301,15 @@ def t_count_adder_theory(n_bits: int) -> int:
     """
     n = max(int(n_bits), 0)
     return int(8 * n)
+
+
+def cnot_count_adder_theory(n_bits: int) -> int:
+    """
+    Order-of-magnitude CNOT for one ``n``-bit adder (arithmetic index oracle).
+
+    Uses ``~ 10 n`` as a transparent linear companion to
+    :func:`t_count_adder_theory` (``~ 8 n`` ``T``). Same scaling intent:
+    arithmetic index oracles are linear in bit width, unlike lookup MCX.
+    """
+    n = max(int(n_bits), 0)
+    return int(10 * n)
