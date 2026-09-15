@@ -2858,6 +2858,409 @@ def qsvt_block_encoding_cost_model(
     }
 
 
+def build_signal_reflection_r0(
+    n_qubits: int,
+    *,
+    data_qubit: int = 0,
+    name: str = "R_0",
+) -> QuantumCircuit:
+    """
+    Pechan-correct reflection about the BE success flag ``|0⟩_data``.
+
+    For
+    ``(⟨0|_data ⊗ I) U_H (|0⟩_data ⊗ I) = H/α``,
+    the projector is ``Π = |0⟩⟨0|_data``, so
+    ``R_0 = 2Π - I = Z`` on the data qubit (Clifford; free in the T ledger).
+    """
+    qc = QuantumCircuit(int(n_qubits), name=name)
+    qc.z(int(data_qubit))
+    return qc
+
+
+def build_full_ancilla_reflection_r0(
+    n_ancilla: int,
+    *,
+    name: str = "R_0_full",
+) -> QuantumCircuit:
+    """
+    Reflection ``2|0…0⟩⟨0…0| - I`` on ``n_ancilla`` qubits (LCU-style).
+
+    Not the Pechan BE projector (that is data-only); kept for cost comparison
+    and prepare-|0⟩ conventions. Implemented as ``X^n · MCZ · X^n``.
+    """
+    n = int(n_ancilla)
+    if n <= 0:
+        raise ValueError("n_ancilla must be positive")
+    qc = QuantumCircuit(n, name=name)
+    if n == 1:
+        qc.z(0)
+        return qc
+    for q in range(n):
+        qc.x(q)
+    # MCZ via H on target + MCX + H
+    target = n - 1
+    controls = list(range(n - 1))
+    qc.h(target)
+    qc.mcx(controls, target)
+    qc.h(target)
+    for q in range(n):
+        qc.x(q)
+    return qc
+
+
+def reflection_r0_gate_budget(
+    *,
+    mode: str = "signal",
+    n_ancilla: int = 1,
+) -> dict[str, object]:
+    """
+    T / CNOT ledger for ``R_0``.
+
+    ``mode="signal"`` — Pechan ``Z`` on data (Clifford).
+    ``mode="full"`` — MCZ on ``n_ancilla`` qubits (Barenco MCX model).
+    """
+    m = str(mode).lower()
+    if m in ("signal", "data", "pechan"):
+        return {
+            "mode": "signal",
+            "n_ancilla": 1,
+            "t_r0": 0,
+            "cnot_r0": 0,
+            "note": "Z on data (Clifford)",
+        }
+    n = int(n_ancilla)
+    # X^n free Clifford; MCZ ≃ MCX with (n-1) controls
+    t_mcx = t_count_mcx(n - 1)
+    cnot_mcx = cnot_count_mcx(n - 1)
+    return {
+        "mode": "full",
+        "n_ancilla": n,
+        "t_r0": int(t_mcx),
+        "cnot_r0": int(cnot_mcx),
+        "note": "X^n · MCZ · X^n (MCX model)",
+    }
+
+
+def build_qubitized_walk_circuit(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    scale: float | None = None,
+    materialize_lookup: bool | str = "opaque",
+    use_imag: bool = True,
+    reflection: str = "signal",
+    circuit_name: str = "W",
+) -> tuple[QuantumCircuit, float, dict[str, object]]:
+    """
+    Qubitized walk ``W = R_0 U_H`` on Pechan registers ``data|d|m|idx``.
+
+    Circuit order: apply ``U_H``, then ``R_0`` (so the unitary is ``R_0 U_H``).
+
+    ``reflection``:
+      * ``\"signal\"`` (default) — ``Z`` on data (matches Pechan projector);
+      * ``\"full\"`` — reflect about ``|0⟩`` on ``data|d|m`` (LCU-style).
+
+    For readable notebook figures prefer :func:`build_qubitized_walk_schematic`
+    (five Pechan blocks + ``R_0``) instead of opaque multiplexed ``Ry``.
+    """
+    uh, alpha = build_hamiltonian_block_encoding_circuit(
+        oracle,
+        scale=scale,
+        materialize_lookup=materialize_lookup,
+        use_imag=use_imag,
+        name="U_H",
+    )
+    n = uh.num_qubits
+    n_anc = 1 + int(oracle.n_d_qubits) + int(oracle.n_m_qubits)
+    ref = str(reflection).lower()
+    if ref in ("signal", "data", "pechan"):
+        r0 = build_signal_reflection_r0(n, data_qubit=0, name="R_0")
+        r0_budget = reflection_r0_gate_budget(mode="signal")
+    elif ref in ("full", "ancilla", "prepare0"):
+        r0_full = build_full_ancilla_reflection_r0(n_anc, name="R_0_full")
+        r0 = QuantumCircuit(n, name="R_0_full")
+        r0.compose(r0_full, qubits=list(range(n_anc)), inplace=True)
+        r0_budget = reflection_r0_gate_budget(mode="full", n_ancilla=n_anc)
+    else:
+        raise ValueError(f"Unknown reflection mode: {reflection!r}")
+
+    walk = QuantumCircuit(n, name=circuit_name)
+    walk.compose(uh, inplace=True)
+    walk.compose(r0, inplace=True)
+    meta = {
+        "n_qubits": n,
+        "n_ancilla_be": n_anc,
+        "n_idx": int(oracle.n_index_qubits),
+        "reflection": r0_budget["mode"],
+        "materialize_lookup": _normalize_lookup_mode(materialize_lookup),
+        "alpha": float(alpha),
+        **{k: r0_budget[k] for k in ("t_r0", "cnot_r0", "note")},
+    }
+    return walk, float(alpha), meta
+
+
+def build_qubitized_walk_schematic(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    scale: float | None = None,
+    use_imag: bool = True,
+    reflection: str = "signal",
+    coarse: bool = False,
+    circuit_name: str | None = None,
+) -> tuple[QuantumCircuit, float, dict[str, object]]:
+    """
+    Draw-friendly walk ``W = R_0 U_H``.
+
+    ``coarse=False`` (default): Pechan skeleton
+    ``O_c^{-1} · O_data · Z · O_t · O_r`` then ``R_0`` (same blocks as §8 schematic).
+
+    ``coarse=True``: single opaque ``U_H`` box then ``R_0`` (emphasizes qubitization).
+    """
+    n = int(oracle.num_qubits_uh)
+    n_anc = 1 + int(oracle.n_d_qubits) + int(oracle.n_m_qubits)
+    ref = str(reflection).lower()
+    if ref in ("signal", "data", "pechan"):
+        r0 = build_signal_reflection_r0(n, data_qubit=0, name="R_0")
+        r0_budget = reflection_r0_gate_budget(mode="signal")
+    elif ref in ("full", "ancilla", "prepare0"):
+        r0_full = build_full_ancilla_reflection_r0(n_anc, name="R_0_full")
+        r0 = QuantumCircuit(n, name="R_0_full")
+        r0.compose(r0_full, qubits=list(range(n_anc)), inplace=True)
+        r0_budget = reflection_r0_gate_budget(mode="full", n_ancilla=n_anc)
+    else:
+        raise ValueError(f"Unknown reflection mode: {reflection!r}")
+
+    if coarse:
+        target = oracle.matrix.imag if use_imag else oracle.matrix.real
+        alpha = float(scale if scale is not None else spectral_scale(target))
+        if alpha < 1e-15:
+            alpha = 1.0
+        name = circuit_name or "W"
+        walk = QuantumCircuit(n, name=name)
+        walk.append(Gate("U_H", n, []), list(range(n)))
+        walk.compose(r0, inplace=True)
+        style = "coarse"
+    else:
+        uh, alpha = build_hamiltonian_block_encoding_schematic(
+            oracle, scale=scale, use_imag=use_imag, name="U_H"
+        )
+        name = circuit_name or "W"
+        walk = QuantumCircuit(n, name=name)
+        walk.compose(uh, inplace=True)
+        walk.compose(r0, inplace=True)
+        style = "pechan_schematic"
+
+    meta = {
+        "n_qubits": n,
+        "n_ancilla_be": n_anc,
+        "n_idx": int(oracle.n_index_qubits),
+        "reflection": r0_budget["mode"],
+        "draw_style": style,
+        "alpha": float(alpha),
+        **{k: r0_budget[k] for k in ("t_r0", "cnot_r0", "note")},
+    }
+    return walk, float(alpha), meta
+
+
+def build_controlled_uh_schematic(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    scale: float | None = None,
+    use_imag: bool = True,
+    name: str = "cU_H",
+) -> tuple[QuantumCircuit, float]:
+    """
+    One-control schematic of ``U_H`` (opaque body) for QSVT / walk diagrams.
+
+    Does not expand index oracles; the controlled block is a single named gate.
+    """
+    uh, alpha = build_hamiltonian_block_encoding_schematic(
+        oracle, scale=scale, use_imag=use_imag, name="U_H"
+    )
+    n = uh.num_qubits
+    qc = QuantumCircuit(1 + n, name=name)
+    qc.append(Gate(name, 1 + n, []), list(range(1 + n)))
+    return qc, float(alpha)
+
+
+def dense_hermitian_block_encoding_matrix(
+    H: np.ndarray,
+    alpha: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """
+    One-ancilla Hermitian dilation of Hermitian ``H``:
+      ``U = [[A, S], [S, -A]]`` with ``A = H/α``, ``S = √(I - A²)``.
+    """
+    H = np.asarray(H, dtype=complex)
+    H = 0.5 * (H + H.conj().T)
+    nrm = float(np.linalg.norm(H, 2))
+    a = float(alpha) if alpha is not None else nrm
+    if a < 1e-15:
+        a = 1.0
+    if nrm > a * (1.0 + 1e-12):
+        a = nrm
+    A = H / a
+    w, V = np.linalg.eigh(A)
+    w = np.clip(np.real(w), -1.0, 1.0)
+    A = (V * w) @ V.conj().T
+    S = (V * np.sqrt(np.maximum(0.0, 1.0 - w**2))) @ V.conj().T
+    U = np.block([[A, S], [S, -A]])
+    return U, a
+
+
+def build_dense_qubitized_walk_matrix(
+    H: np.ndarray,
+    alpha: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Return ``(W, U, R_0, alpha)`` for the one-ancilla dilation walk ``W = R_0 U``."""
+    U, a = dense_hermitian_block_encoding_matrix(H, alpha)
+    n = H.shape[0]
+    eye = np.eye(n, dtype=complex)
+    R0 = np.block([[eye, np.zeros((n, n))], [np.zeros((n, n)), -eye]])
+    W = R0 @ U
+    return W, U, R0, a
+
+
+def qubitized_walk_phase_targets(
+    H: np.ndarray,
+    alpha: float | None = None,
+) -> pd.DataFrame:
+    """
+    Classical Low–Chuang targets: for each eigenvalue ``λ`` of Hermitian ``H``,
+    ``θ = arccos(clip(λ/α))`` and walk phases ``e^{±iθ}``.
+    """
+    H = np.asarray(H, dtype=complex)
+    H = 0.5 * (H + H.conj().T)
+    nrm = float(np.linalg.norm(H, 2))
+    a = float(alpha) if alpha is not None else nrm
+    if a < 1e-15:
+        a = 1.0
+    evals = np.linalg.eigvalsh(H)
+    rows: list[dict[str, object]] = []
+    for lam in evals:
+        x = float(np.clip(np.real(lam) / a, -1.0, 1.0))
+        theta = float(np.arccos(x))
+        rows.append(
+            {
+                "lambda": float(np.real(lam)),
+                "lambda_over_alpha": x,
+                "theta": theta,
+                "exp_i_theta": np.exp(1j * theta),
+                "exp_m_i_theta": np.exp(-1j * theta),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def verify_dense_qubitized_walk(
+    H: np.ndarray,
+    *,
+    alpha: float | None = None,
+    atol: float = 1e-8,
+) -> dict[str, object]:
+    """
+    Dense unit test of qubitization: ``W = R_0 U`` eigenphases match
+    ``±arccos(λ/α)`` for the one-ancilla Hermitian dilation of ``H``.
+    """
+    H = np.asarray(H, dtype=complex)
+    H = 0.5 * (H + H.conj().T)
+    W, U, _R0, a = build_dense_qubitized_walk_matrix(H, alpha)
+    n = H.shape[0]
+    be_err = float(np.linalg.norm(U[:n, :n] - H / a))
+    uh_err = float(np.linalg.norm(U.conj().T @ U - np.eye(2 * n)))
+    wh_err = float(np.linalg.norm(W.conj().T @ W - np.eye(2 * n)))
+
+    targets_df = qubitized_walk_phase_targets(H, a)
+    thetas = targets_df["theta"].to_numpy(dtype=float)
+    targets = np.concatenate([np.exp(1j * thetas), np.exp(-1j * thetas)])
+    evals_W = np.linalg.eigvals(W)
+    mod_err = float(np.max(np.abs(np.abs(evals_W) - 1.0)))
+    # Greedy multiset match (sorting angles fails on ±θ ties / ordering).
+    remaining = [complex(z) for z in evals_W]
+    match_errs: list[float] = []
+    for t in targets:
+        j = int(np.argmin([abs(z - t) for z in remaining]))
+        match_errs.append(float(abs(remaining.pop(j) - t)))
+    phase_err = float(max(match_errs)) if match_errs else 0.0
+    ok = (
+        be_err <= atol
+        and uh_err <= atol
+        and wh_err <= atol
+        and mod_err <= atol
+        and phase_err <= max(atol, 1e-7)
+    )
+    return {
+        "ok": bool(ok),
+        "alpha": a,
+        "n": n,
+        "be_block_err": be_err,
+        "U_unitarity_err": uh_err,
+        "W_unitarity_err": wh_err,
+        "W_modulus_err": mod_err,
+        "phase_match_err": phase_err,
+        "n_eigenvalues": int(len(evals_W)),
+        "atol": float(atol),
+    }
+
+
+def summarize_qubitization_milestones(
+    *,
+    toy_ok: bool | None = None,
+    walk_built: bool = True,
+) -> pd.DataFrame:
+    """Status table for §18 milestones (implemented vs deferred)."""
+    rows = [
+        {
+            "id": "M0",
+            "item": "Arith / lookup cost freeze of U_H",
+            "status": "done",
+            "where": "§13 / §17",
+        },
+        {
+            "id": "M1",
+            "item": "Controlled-U_H schematic + U_H† via .inverse()",
+            "status": "done",
+            "where": "build_controlled_uh_schematic",
+        },
+        {
+            "id": "M2",
+            "item": "Ancilla reflection R_0 (Pechan Z_data)",
+            "status": "done",
+            "where": "build_signal_reflection_r0",
+        },
+        {
+            "id": "M3",
+            "item": "Walk W = R_0 U_H + eigenphase check",
+            "status": "done" if walk_built else "partial",
+            "where": "build_qubitized_walk_circuit; verify_dense_qubitized_walk",
+        },
+        {
+            "id": "M3b",
+            "item": "Dense toy walk spectrum vs arccos(λ/α)",
+            "status": ("done" if toy_ok else "pending") if toy_ok is not None else "run demo",
+            "where": "verify_dense_qubitized_walk",
+        },
+        {
+            "id": "M4",
+            "item": "QSP/QSVT phases calling Pechan U_H",
+            "status": "deferred",
+            "where": "§16 Chebyshev oracle; ledger only for circuit queries",
+        },
+        {
+            "id": "M5",
+            "item": "End-to-end qubitized HS + subvolume on tiny grid",
+            "status": "deferred",
+            "where": "§16c uses expm(H), not walk queries",
+        },
+        {
+            "id": "M6",
+            "item": "Factored / SELECT walk (optional)",
+            "status": "deferred",
+            "where": "§17 encodings available as U_H substitutes",
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
 def qubitization_plan_ledger(
     oracle: HamiltonianOracleLabeling,
     time: float,
@@ -2865,19 +3268,22 @@ def qubitization_plan_ledger(
     epsilon: float = 1e-3,
     uh_calls_per_iterate: int = 2,
     use_arith_uh: bool = True,
+    reflection: str = "signal",
 ) -> dict[str, object]:
     """
-    Theoretical qubitization / QSVT cost ledger for Pechan ``U_H`` (§18).
+    Qubitization / QSVT cost ledger for Pechan ``U_H`` (§18).
 
-    Does **not** synthesize the walk circuit. Uses:
-      * Low–Chuang degree ``d ≈ ⌈α t + log₂(1/ε)⌉`` (§16);
-      * one-query ``T`` / CNOT of ``U_H`` from §13
-        (``t_uh_arith_theory`` if ``use_arith_uh``, else lookup);
-      * ``uh_calls_per_iterate`` ≈ 2 for a standard Szegedy / Low–Chuang
-        iterate ``W ∼ R₀ U_H`` (reflection + one controlled ``U_H``, counted
-        as two one-sided ``U_H``-scale calls in this coarse ledger).
+    Circuit construction for ``R_0`` and ``W = R_0 U_H`` is implemented
+    (:func:`build_qubitized_walk_circuit`). Full multi-query Statevector QSVT
+    that repeatedly calls Pechan ``U_H`` remains deferred — this ledger only
+    multiplies one-query costs by the Low–Chuang degree.
 
-    Total gate estimate: ``d · uh_calls_per_iterate · cost(U_H)``.
+    Uses:
+      * degree ``d ≈ ⌈α t + log₂(1/ε)⌉`` (§16);
+      * one-query ``T`` / CNOT of ``U_H`` from §13;
+      * ``uh_calls_per_iterate`` ≈ 2 for controlled-``U_H`` / ``U_H†`` in QSVT;
+      * Pechan ``R_0 = Z_data`` is Clifford (``t_r0 = 0``) unless
+        ``reflection=\"full\"``.
     """
     base = qsvt_block_encoding_cost_model(oracle, time, epsilon=epsilon)
     uh = explicit_hamiltonian_uh_t_budget(oracle)
@@ -2891,28 +3297,34 @@ def qubitization_plan_ledger(
         uh_mode = "lookup"
     d = int(base["qsvt_queries"])
     calls = int(uh_calls_per_iterate)
+    n_anc = int(1 + oracle.n_d_qubits + oracle.n_m_qubits)
+    r0 = reflection_r0_gate_budget(
+        mode=reflection,
+        n_ancilla=n_anc if str(reflection).lower() in ("full", "ancilla", "prepare0") else 1,
+    )
+    t_walk = int(calls * t_uh + r0["t_r0"])
+    cnot_walk = int(calls * cnot_uh + r0["cnot_r0"])
     return {
         **base,
         "uh_mode": uh_mode,
         "uh_calls_per_iterate": calls,
+        "reflection": r0["mode"],
+        "t_r0": int(r0["t_r0"]),
+        "cnot_r0": int(r0["cnot_r0"]),
         "t_uh_per_call": t_uh,
         "cnot_uh_per_call": cnot_uh,
-        "t_walk_iterate_est": int(calls * t_uh),
-        "cnot_walk_iterate_est": int(calls * cnot_uh),
-        "t_qubitized_HS_est": int(d * calls * t_uh),
-        "cnot_qubitized_HS_est": int(d * calls * cnot_uh),
+        "t_walk_iterate_est": t_walk,
+        "cnot_walk_iterate_est": cnot_walk,
+        "t_qubitized_HS_est": int(d * t_walk),
+        "cnot_qubitized_HS_est": int(d * cnot_walk),
         "n_d": int(oracle.n_d_qubits),
         "n_m": int(oracle.n_m_qubits),
         "n_idx": int(oracle.n_index_qubits),
-        "n_ancilla_be": int(1 + oracle.n_d_qubits + oracle.n_m_qubits),
-        "milestones": (
-            "U_H verified",
-            "ancilla reflection R_0",
-            "walk iterate W",
-            "QSP/QSVT phase factors",
-            "controlled-W HS circuit",
-            "postselect / amplify + measure",
-        ),
+        "n_qubits_uh": int(oracle.num_qubits_uh),
+        "n_ancilla_be": n_anc,
+        "milestones": tuple(summarize_qubitization_milestones()["id"]),
+        "walk_circuit": "build_qubitized_walk_circuit",
+        "qsvt_circuit": "deferred (use §16 Chebyshev for polynomial check)",
     }
 
 
