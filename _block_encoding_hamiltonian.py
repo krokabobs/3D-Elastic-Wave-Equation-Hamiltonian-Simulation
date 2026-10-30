@@ -1867,6 +1867,605 @@ def summarize_explicit_t_vs_naive_3d(
     return pd.DataFrame(rows)
 
 
+def _kth_unused(k: int, used_sorted: np.ndarray) -> int:
+    """0-based ``k``-th integer in ``[0, ∞)`` that does not appear in ``used_sorted``."""
+    y = int(k)
+    for u in used_sorted:
+        if int(u) <= y:
+            y += 1
+        else:
+            break
+    return y
+
+
+class CompactPerm:
+    """
+    Same unused-subspace completion as :func:`_complete_perm_array`, without a
+    ``2^n`` table. Stores only the ``D'`` explicit ``(src, dst)`` pairs.
+    """
+
+    __slots__ = ("dim", "src_to_dst", "dst_to_src", "used_in", "used_out")
+
+    def __init__(self, partial: dict[int, int], dim: int, *, label: str) -> None:
+        self.dim = int(dim)
+        if not partial:
+            empty = np.empty(0, dtype=np.int64)
+            self.src_to_dst = {}
+            self.dst_to_src = {}
+            self.used_in = empty
+            self.used_out = empty
+            return
+        srcs = np.fromiter(partial.keys(), dtype=np.int64, count=len(partial))
+        dsts = np.fromiter(partial.values(), dtype=np.int64, count=len(partial))
+        if dsts.size != np.unique(dsts).size:
+            raise ValueError(f"{label}: permutation is not injective.")
+        order = np.argsort(srcs, kind="mergesort")
+        used_in = srcs[order]
+        used_dst = dsts[order]
+        self.src_to_dst = {int(s): int(d) for s, d in zip(used_in, used_dst)}
+        self.dst_to_src = {int(d): int(s) for s, d in zip(used_in, used_dst)}
+        self.used_in = used_in
+        self.used_out = np.sort(used_dst)
+
+    def apply(self, x: int) -> int:
+        x = int(x)
+        hit = self.src_to_dst.get(x)
+        if hit is not None:
+            return hit
+        rank = x - int(np.searchsorted(self.used_in, x))
+        return _kth_unused(rank, self.used_out)
+
+    def apply_inv(self, y: int) -> int:
+        y = int(y)
+        hit = self.dst_to_src.get(y)
+        if hit is not None:
+            return hit
+        rank = y - int(np.searchsorted(self.used_out, y))
+        return _kth_unused(rank, self.used_in)
+
+
+def _complete_perm_array(partial: dict[int, int], dim: int, *, label: str) -> np.ndarray:
+    """Completed permutation as an ``int32`` array (no ``2^n`` Python dict)."""
+    if dim > np.iinfo(np.int32).max:
+        raise ValueError(f"{label}: dim={dim} exceeds int32 index range.")
+    perm = np.arange(dim, dtype=np.int32)
+    if not partial:
+        return perm
+    assigned = np.zeros(dim, dtype=bool)
+    used_out = np.zeros(dim, dtype=bool)
+    srcs = np.fromiter(partial.keys(), dtype=np.int32, count=len(partial))
+    dsts = np.fromiter(partial.values(), dtype=np.int32, count=len(partial))
+    if dsts.size != np.unique(dsts).size:
+        raise ValueError(f"{label}: permutation is not injective.")
+    perm[srcs] = dsts
+    assigned[srcs] = True
+    used_out[dsts] = True
+    free_out = np.flatnonzero(~used_out).astype(np.int32, copy=False)
+    perm[~assigned] = free_out
+    return perm
+
+
+def _column_oracle_partial(oracle: HamiltonianOracleLabeling) -> tuple[dict[int, int], int]:
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    dim = 1 << (n_d + n_m + n_idx)
+    partial: dict[int, int] = {}
+    for (d_label, m_label), (_, col, _) in oracle.entries_by_dm.items():
+        in_index = _basis_index(
+            [_index_bits(d_label, n_d), _index_bits(m_label, n_m), _index_bits(0, n_idx)]
+        )
+        out_index = _basis_index(
+            [_index_bits(d_label, n_d), _index_bits(m_label, n_m), _index_bits(col, n_idx)]
+        )
+        partial[in_index] = out_index
+    return partial, dim
+
+
+def _row_oracle_partial(oracle: HamiltonianOracleLabeling) -> tuple[dict[int, int], int]:
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    dim = 1 << (n_d + n_m + n_idx)
+    partial: dict[int, int] = {}
+    for (d_label, m_label), (row, col, _) in oracle.entries_by_dm.items():
+        in_index = _basis_index(
+            [_index_bits(d_label, n_d), _index_bits(m_label, n_m), _index_bits(col, n_idx)]
+        )
+        out_index = _basis_index(
+            [_index_bits(d_label, n_d), _index_bits(m_label, n_m), _index_bits(row, n_idx)]
+        )
+        partial[in_index] = out_index
+    return partial, dim
+
+
+def build_column_oracle_perm_array(oracle: HamiltonianOracleLabeling) -> np.ndarray:
+    """``O_c`` permutation on ``d|m|idx`` as an array of length ``2^{n_lookup}``."""
+    partial, dim = _column_oracle_partial(oracle)
+    return _complete_perm_array(partial, dim, label="O_c")
+
+
+def build_row_oracle_perm_array(oracle: HamiltonianOracleLabeling) -> np.ndarray:
+    """``O_r`` permutation on ``d|m|idx`` as an array of length ``2^{n_lookup}``."""
+    partial, dim = _row_oracle_partial(oracle)
+    return _complete_perm_array(partial, dim, label="O_r")
+
+
+def build_column_oracle_compact_perm(oracle: HamiltonianOracleLabeling) -> CompactPerm:
+    """``O_c`` as a compact perm — safe at ``n_{lookup}=27`` (no ``2^{27}`` table)."""
+    partial, dim = _column_oracle_partial(oracle)
+    return CompactPerm(partial, dim, label="O_c")
+
+
+def build_row_oracle_compact_perm(oracle: HamiltonianOracleLabeling) -> CompactPerm:
+    """``O_r`` as a compact perm — safe at ``n_{lookup}=27`` (no ``2^{27}`` table)."""
+    partial, dim = _row_oracle_partial(oracle)
+    return CompactPerm(partial, dim, label="O_r")
+
+
+def build_transpose_oracle_perm_array(oracle: HamiltonianOracleLabeling) -> np.ndarray:
+    """``O_t`` permutation on ``d|m`` (high-``m`` flip for active ``d``)."""
+    n_d, n_m = oracle.n_d_qubits, oracle.n_m_qubits
+    n_dm = 1 << (n_d + n_m)
+    perm = np.arange(n_dm, dtype=np.int32)
+    if n_m == 0:
+        return perm
+    active = np.fromiter(oracle.base.d_to_value.keys(), dtype=np.int32)
+    m_count = 1 << n_m
+    high = 1 << (n_m - 1)
+    for d_label in active:
+        base = int(d_label)  # d is low n_d bits in _basis_index([d, m])
+        for m_label in range(m_count):
+            in_index = _basis_index(
+                [_index_bits(int(d_label), n_d), _index_bits(m_label, n_m)]
+            )
+            out_m = m_label ^ high
+            perm[in_index] = _basis_index(
+                [_index_bits(int(d_label), n_d), _index_bits(out_m, n_m)]
+            )
+    return perm
+
+
+def _uh_pack_index(data: int, d: int, m: int, idx: int, n_d: int, n_m: int) -> int:
+    """Little-endian ``data | d | m | idx`` (matches :func:`_basis_index`)."""
+    return int(data) + (int(d) << 1) + (int(m) << (1 + n_d)) + (int(idx) << (1 + n_d + n_m))
+
+
+def _lookup_perm_as_array(mapping: dict[int, int], dim: int) -> np.ndarray:
+    out = np.arange(dim, dtype=np.int64)
+    for src, dst in mapping.items():
+        out[int(src)] = int(dst)
+    return out
+
+
+def _csr_from_perm(perm: np.ndarray) -> sp.csr_matrix:
+    dim = int(perm.size)
+    return sp.csr_matrix(
+        (np.ones(dim, dtype=complex), (perm.astype(np.int64), np.arange(dim, dtype=np.int64))),
+        shape=(dim, dim),
+    )
+
+
+def _embed_lookup_perm_on_uh(lookup_perm: np.ndarray, n_uh: int) -> sp.csr_matrix:
+    """Permutation on ``d|m|idx`` (bits 1..), identity on ``data`` (LSB)."""
+    n_lookup = int(np.log2(lookup_perm.size))
+    dim = 1 << n_uh
+    cols = np.arange(dim, dtype=np.int64)
+    data_bit = cols & 1
+    lookup_in = cols >> 1
+    lookup_out = lookup_perm[lookup_in]
+    rows = data_bit + (lookup_out << 1)
+    return sp.csr_matrix(
+        (np.ones(dim, dtype=complex), (rows, cols)),
+        shape=(dim, dim),
+    )
+
+
+def _embed_dm_perm_on_uh(
+    dm_perm: np.ndarray,
+    n_d: int,
+    n_m: int,
+    n_idx: int,
+) -> sp.csr_matrix:
+    """Permutation on ``d|m``, identity on ``data`` and ``idx``."""
+    n_uh = 1 + n_d + n_m + n_idx
+    dim = 1 << n_uh
+    cols = np.arange(dim, dtype=np.int64)
+    data_bit = cols & 1
+    rest = cols >> 1
+    d_mask = (1 << n_d) - 1
+    m_mask = (1 << n_m) - 1
+    d = rest & d_mask
+    m = (rest >> n_d) & m_mask
+    idx = rest >> (n_d + n_m)
+    dm_in = d + (m << n_d)
+    dm_out = dm_perm[dm_in]
+    d_out = dm_out & d_mask
+    m_out = dm_out >> n_d
+    rows = data_bit + (d_out << 1) + (m_out << (1 + n_d)) + (idx << (1 + n_d + n_m))
+    return sp.csr_matrix(
+        (np.ones(dim, dtype=complex), (rows, cols)),
+        shape=(dim, dim),
+    )
+
+
+def _embed_odata_on_uh(odata: np.ndarray, n_d: int, n_m: int, n_idx: int) -> sp.csr_matrix:
+    """``O_data`` on ``data|d`` (low ``1+n_d`` bits), identity on ``m|idx``."""
+    n_low = 1 + n_d
+    n_high = n_m + n_idx
+    odata_sp = sp.csr_matrix(np.asarray(odata, dtype=complex))
+    dim = 1 << (n_low + n_high)
+    # Block-diagonal stack without densifying.
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    data: list[np.ndarray] = []
+    coo = odata_sp.tocoo()
+    for high in range(1 << n_high):
+        shift = high << n_low
+        rows.append(coo.row + shift)
+        cols.append(coo.col + shift)
+        data.append(coo.data)
+    return sp.csr_matrix(
+        (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(dim, dim),
+    )
+
+
+def _z_data_csr(n_uh: int) -> sp.csr_matrix:
+    dim = 1 << n_uh
+    diag = np.where((np.arange(dim) & 1) == 0, 1.0, -1.0).astype(complex)
+    return sp.diags(diag, format="csr")
+
+
+def build_sparse_uh_matrix(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    scale: float | None = None,
+    use_imag: bool = True,
+) -> tuple[sp.csr_matrix, float]:
+    """
+    Assemble the Pechan unitary ``U_H = O_c^{-1} O_data Z O_t O_r`` as CSR.
+
+    Same operator as ``Operator(U_H)`` on ``data|d|m|idx``, but never stores the
+    dense ``2^{n_{U_H}} × 2^{n_{U_H}}`` array (16 GB on ``2×2×2``). Each factor
+    is a permutation or a multiplexed ``R_y`` (two nonzeros per column), so
+    ``U_H`` stays ``O(2^{n_{U_H}})`` in memory.
+    """
+    target = oracle.matrix.imag if use_imag else oracle.matrix.real
+    alpha = float(scale if scale is not None else spectral_scale(target))
+    if alpha < 1e-15:
+        alpha = 1.0
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    n_uh = int(oracle.num_qubits_uh)
+
+    oc_perm = build_column_oracle_perm_array(oracle)
+    or_perm = build_row_oracle_perm_array(oracle)
+    ot_perm = build_transpose_oracle_perm_array(oracle)
+
+    payload = imag_payload(oracle.base) if use_imag else np.real(oracle.base.value_table)
+    odata = _embed_odata_operator(payload, alpha, n_d)
+
+    oc_inv = _embed_lookup_perm_on_uh(oc_perm, n_uh).T.tocsr()
+    o_r = _embed_lookup_perm_on_uh(or_perm, n_uh)
+    o_t = _embed_dm_perm_on_uh(ot_perm, n_d, n_m, n_idx)
+    o_data = _embed_odata_on_uh(odata, n_d, n_m, n_idx)
+    z = _z_data_csr(n_uh)
+    uh = oc_inv @ o_data @ z @ o_t @ o_r
+    return uh.tocsr(), alpha
+
+
+def _apply_lookup_perm(psi: np.ndarray, perm: np.ndarray, *, inverse: bool = False) -> np.ndarray:
+    """Apply a ``d|m|idx`` permutation with identity on the ``data`` LSB."""
+    even = psi[0::2]
+    odd = psi[1::2]
+    out = np.empty_like(psi)
+    if inverse:
+        # (P^{-1} ψ)[k] = ψ[perm[k]]
+        out[0::2] = even[perm]
+        out[1::2] = odd[perm]
+    else:
+        # (P ψ)[perm[k]] = ψ[k]
+        out_even = np.empty_like(even)
+        out_odd = np.empty_like(odd)
+        out_even[perm] = even
+        out_odd[perm] = odd
+        out[0::2] = out_even
+        out[1::2] = out_odd
+    return out
+
+
+def _apply_dm_perm(psi: np.ndarray, dm_perm: np.ndarray, n_d: int, n_m: int, n_idx: int) -> np.ndarray:
+    """Apply an ``O_t`` permutation on ``d|m`` (identity on ``data`` and ``idx``)."""
+    del n_idx
+    n_low = 1 + n_d + n_m
+    x = psi.reshape(-1, 1 << n_low)
+    low = np.arange(1 << n_low, dtype=np.int32)
+    dest = (low & 1) + (dm_perm[low >> 1].astype(np.int32) << 1)
+    out = np.empty_like(x)
+    out[:, dest] = x
+    return out.ravel()
+
+
+def _apply_z_data(psi: np.ndarray) -> np.ndarray:
+    out = psi.copy()
+    out[1::2] *= -1.0
+    return out
+
+
+def _apply_odata(
+    psi: np.ndarray,
+    odata: np.ndarray,
+    n_d: int,
+    *,
+    adjoint: bool = False,
+) -> np.ndarray:
+    """Apply ``O_data`` (or ``O_data^†``) on ``data|d`` (chunked matvec)."""
+    n_low = 1 + n_d
+    x = psi.reshape(-1, 1 << n_low)
+    mat = np.asarray(odata, dtype=complex)
+    mat_t = mat.conj() if adjoint else mat.T
+    out = np.empty_like(x)
+    step = max(1, min(x.shape[0], 4096))
+    for i in range(0, x.shape[0], step):
+        out[i : i + step] = x[i : i + step] @ mat_t
+    return out.ravel()
+
+
+def _perm_map(perm: CompactPerm | np.ndarray, x: int, *, inverse: bool = False) -> int:
+    """Apply a compact or dense permutation (and optional inverse)."""
+    if isinstance(perm, CompactPerm):
+        return perm.apply_inv(x) if inverse else perm.apply(x)
+    arr = np.asarray(perm)
+    if inverse:
+        inv = np.empty_like(arr)
+        inv[arr] = np.arange(arr.size, dtype=arr.dtype)
+        return int(inv[x])
+    return int(arr[x])
+
+
+def apply_pechan_uh_basis(
+    oracle: HamiltonianOracleLabeling,
+    basis_index: int,
+    *,
+    factors: dict[str, object] | None = None,
+    use_imag: bool = True,
+    inverse: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Apply ``U_H`` (or ``U_H^dagger``) to a computational-basis state.
+
+    Returns ``(indices, values)`` of the sparse output. After ``O_data`` the
+    support is at most ``2^{1+n_d}`` amplitudes — so 28-qubit checks do not
+    allocate a 2**28 dense vector.
+    """
+    if factors is None:
+        factors = pechan_uh_apply_factors(oracle, use_imag=use_imag)
+    oc_perm = factors["oc_perm"]
+    or_perm = factors["or_perm"]
+    ot_perm = np.asarray(factors["ot_perm"])
+    odata = np.asarray(factors["odata"], dtype=complex)
+    n_d = int(factors["n_d"])
+    n_m = int(factors["n_m"])
+    n_idx = int(factors["n_idx"])
+    n_low = 1 + n_d
+    n_dm = 1 + n_d + n_m
+    del n_idx
+
+    ot_inv = np.empty_like(ot_perm)
+    ot_inv[ot_perm] = np.arange(ot_perm.size, dtype=ot_perm.dtype)
+
+    def apply_lookup(idx: int, perm: CompactPerm | np.ndarray, *, inverse: bool = False) -> int:
+        return (idx & 1) + (_perm_map(perm, idx >> 1, inverse=inverse) << 1)
+
+    def apply_ot(idx: int, perm: np.ndarray) -> int:
+        data = idx & 1
+        low = (idx >> 1) & ((1 << (n_d + n_m)) - 1)
+        high = idx >> n_dm
+        new_low = int(perm[low])
+        return data + (new_low << 1) + (high << n_dm)
+
+    idx = int(basis_index)
+    val = 1.0 + 0.0j
+    if not inverse:
+        idx = apply_lookup(idx, or_perm)
+        idx = apply_ot(idx, ot_perm)
+        if idx & 1:
+            val *= -1.0
+        # O_data on data|d: mix the 2^{1+n_d} low block
+        high = idx >> n_low
+        low = idx & ((1 << n_low) - 1)
+        col = odata[:, low]
+        nz = np.flatnonzero(np.abs(col) > 1e-12)
+        indices = ((high << n_low) + nz).astype(np.int64)
+        values = val * col[nz]
+        # O_c^{-1} on each
+        out_i = np.empty(indices.size, dtype=np.int64)
+        for j, ii in enumerate(indices):
+            out_i[j] = apply_lookup(int(ii), oc_perm, inverse=True)
+        return out_i, values
+    # inverse: Oc, O_data^dagger, Z, Ot, Or^{-1}
+    idx = apply_lookup(idx, oc_perm)
+    high = idx >> n_low
+    low = idx & ((1 << n_low) - 1)
+    # (O^dagger e_low)[r] = O[low, r].conj()
+    col = odata[low, :].conj()
+    nz = np.flatnonzero(np.abs(col) > 1e-12)
+    indices = ((high << n_low) + nz).astype(np.int64)
+    values = val * col[nz]
+    for j, ii in enumerate(indices):
+        v = values[j]
+        if int(ii) & 1:
+            v = -v
+        ii2 = apply_ot(int(ii), ot_inv)
+        ii2 = apply_lookup(ii2, or_perm, inverse=True)
+        indices[j] = ii2
+        values[j] = v
+    return indices, values
+
+
+def apply_pechan_uh(
+    oracle: HamiltonianOracleLabeling,
+    psi: np.ndarray,
+    *,
+    factors: dict[str, object] | None = None,
+    use_imag: bool = True,
+    inverse: bool = False,
+) -> np.ndarray:
+    """
+    Apply Pechan ``U_H`` (or ``U_H^†``) to a full-register state without CSR.
+
+    Factors are permutations + a small ``O_data`` matrix. Used when
+    ``2^{n_{U_H}}`` is too large to store the CSR product (~12 GB at 28 qubits).
+    """
+    if factors is None:
+        factors = pechan_uh_apply_factors(oracle, use_imag=use_imag)
+    oc_perm = factors["oc_perm"]
+    or_perm = factors["or_perm"]
+    ot_perm = factors["ot_perm"]
+    odata = factors["odata"]
+    n_d = int(factors["n_d"])
+    n_m = int(factors["n_m"])
+    n_idx = int(factors["n_idx"])
+    vec = np.asarray(psi, dtype=complex)
+    if not inverse:
+        # Matches CSR ``Oc^{-1} O_data Z O_t O_r``: Or, Ot, Z, O_data, Oc^{-1}.
+        vec = _apply_lookup_perm(vec, or_perm)
+        vec = _apply_dm_perm(vec, ot_perm, n_d, n_m, n_idx)
+        vec = _apply_z_data(vec)
+        vec = _apply_odata(vec, odata, n_d)
+        vec = _apply_lookup_perm(vec, oc_perm, inverse=True)
+    else:
+        vec = _apply_lookup_perm(vec, oc_perm)
+        vec = _apply_odata(vec, odata, n_d, adjoint=True)
+        vec = _apply_z_data(vec)
+        vec = _apply_dm_perm(vec, ot_perm, n_d, n_m, n_idx)
+        vec = _apply_lookup_perm(vec, or_perm, inverse=True)
+    return vec
+
+
+def pechan_uh_apply_factors(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    scale: float | None = None,
+    use_imag: bool = True,
+    compact: bool | None = None,
+) -> dict[str, object]:
+    """Permutations + small ``O_data`` needed by :func:`apply_pechan_uh`."""
+    target = oracle.matrix.imag if use_imag else oracle.matrix.real
+    alpha = float(scale if scale is not None else spectral_scale(target))
+    if alpha < 1e-15:
+        alpha = 1.0
+    payload = imag_payload(oracle.base) if use_imag else np.real(oracle.base.value_table)
+    n_lookup = int(oracle.n_d_qubits + oracle.n_m_qubits + oracle.n_index_qubits)
+    if compact is None:
+        # Full int32 tables are fine through ~20 lookup qubits; at 27 they are ~0.5 GB
+        # each and ``np.flatnonzero`` completion thrashes a 16 GB laptop.
+        compact = n_lookup > 20
+    if compact:
+        oc_perm: CompactPerm | np.ndarray = build_column_oracle_compact_perm(oracle)
+        or_perm: CompactPerm | np.ndarray = build_row_oracle_compact_perm(oracle)
+    else:
+        oc_perm = build_column_oracle_perm_array(oracle)
+        or_perm = build_row_oracle_perm_array(oracle)
+    return {
+        "alpha": alpha,
+        "oc_perm": oc_perm,
+        "or_perm": or_perm,
+        "ot_perm": build_transpose_oracle_perm_array(oracle),
+        "odata": _embed_odata_operator(payload, alpha, oracle.n_d_qubits),
+        "n_d": int(oracle.n_d_qubits),
+        "n_m": int(oracle.n_m_qubits),
+        "n_idx": int(oracle.n_index_qubits),
+        "n_qubits_uh": int(oracle.num_qubits_uh),
+        "compact": compact,
+    }
+
+
+def extract_encoded_block_from_uh(
+    uh: sp.spmatrix,
+    oracle: HamiltonianOracleLabeling,
+) -> np.ndarray:
+    """Read ``(⟨0|_data ⟨0|_d ⟨0|_m ⟨i|_idx) U_H (|0⟩_data |0⟩_d |0⟩_m |j⟩_idx)``."""
+    n_d, n_m, n_idx = oracle.n_d_qubits, oracle.n_m_qubits, oracle.n_index_qubits
+    n = oracle.n_grid
+    block = np.zeros((n, n), dtype=complex)
+    uh_csr = uh.tocsr()
+    for col in range(n):
+        in_idx = _uh_pack_index(0, 0, 0, col, n_d, n_m)
+        e = np.zeros(uh_csr.shape[0], dtype=complex)
+        e[in_idx] = 1.0
+        out = uh_csr @ e
+        for row in range(n):
+            out_idx = _uh_pack_index(0, 0, 0, row, n_d, n_m)
+            block[row, col] = out[out_idx]
+    return block
+
+
+def compare_sparse_uh_to_classical(
+    oracle: HamiltonianOracleLabeling,
+    *,
+    use_imag: bool = True,
+    rng_seed: int = 0,
+    materialize_csr: bool | None = None,
+) -> dict[str, object]:
+    """
+    Build / apply Pechan ``U_H`` (same map as dense ``Operator(U_H)``).
+
+    ``materialize_csr``:
+      * ``True`` — form the CSR product (fine at 15 qubits, ~1.4 MB);
+      * ``False`` — factorized apply only (required at 26–28 qubits);
+      * ``None`` — CSR if ``n_{U_H} <= 20``, else apply.
+    """
+    n_uh = int(oracle.num_qubits_uh)
+    dim = 1 << n_uh
+    if materialize_csr is None:
+        materialize_csr = n_uh <= 20
+    rng = np.random.default_rng(rng_seed)
+
+    if materialize_csr:
+        psi = rng.normal(size=dim) + 1j * rng.normal(size=dim)
+        psi /= np.linalg.norm(psi)
+        uh, alpha = build_sparse_uh_matrix(oracle, use_imag=use_imag)
+        unitarity_err = float(np.linalg.norm(uh.conj().T @ (uh @ psi) - psi))
+        nbytes = int(uh.data.nbytes + uh.indices.nbytes + uh.indptr.nbytes)
+        nnz = int(uh.nnz)
+        mode = "csr"
+        csr_mb = nbytes / (1024.0**2)
+        block_err = None
+    else:
+        factors = pechan_uh_apply_factors(oracle, use_imag=use_imag)
+        alpha = float(factors["alpha"])
+        # Full 2^{n} vectors are hostile at 26–28 qubits (~1–4 GB each).
+        # A basis state stays ≤ 2^{1+n_d} nonzeros after O_data.
+        k = int(rng.integers(0, dim))
+        idx_u, val_u = apply_pechan_uh_basis(
+            oracle, k, factors=factors, use_imag=use_imag
+        )
+        acc: dict[int, complex] = {}
+        for ii, vv in zip(idx_u.tolist(), val_u.tolist()):
+            idx_b, val_b = apply_pechan_uh_basis(
+                oracle, int(ii), factors=factors, use_imag=use_imag, inverse=True
+            )
+            for a, b in zip(idx_b.tolist(), val_b.tolist()):
+                acc[int(a)] = acc.get(int(a), 0.0) + complex(vv) * complex(b)
+        recon = acc.get(k, 0.0)
+        off = sum(abs(v) ** 2 for key, v in acc.items() if key != k)
+        unitarity_err = float(abs(recon - 1.0) + off**0.5)
+        nnz = 2 * dim
+        mode = "apply_basis"
+        csr_mb = (dim * 44) / (1024.0**2)
+        block_err = None
+
+    return {
+        "alpha": float(alpha),
+        "n_qubits_uh": n_uh,
+        "uh_dim": dim,
+        "uh_nnz": nnz,
+        "uh_csr_MB": csr_mb,
+        "dense_UH_GB": _dense_unitary_gb(dim),
+        "unitarity_err": unitarity_err,
+        "col_nnz": float(nnz) / float(dim),
+        "mode": mode,
+        "block_err": block_err,
+    }
+
+
 def reconstructed_normalized_hamiltonian(
     oracle: HamiltonianOracleLabeling,
     alpha: float,
@@ -1884,15 +2483,35 @@ def reconstructed_normalized_hamiltonian(
 
 
 def _embed_odata_operator(payload: np.ndarray, alpha: float, n_d: int) -> np.ndarray:
-    """Dense ``O_data`` on ``(data, d)`` only (small: ``2^{1+n_d}``)."""
-    from qiskit.quantum_info import Operator
+    """
+    ``O_data`` on ``(data, d)`` only (``2^{1+n_d}``).
 
-    circuit = data_loading_subcircuit(payload, alpha)
-    if circuit.num_qubits < 1 + n_d:
-        padded = QuantumCircuit(1 + n_d, name="O_data_pad")
-        padded.compose(circuit, qubits=list(range(circuit.num_qubits)), inplace=True)
-        circuit = padded
-    return Operator(circuit).data
+    Same multiplexed ``R_y`` as :func:`data_loading_subcircuit`, but assembled
+    as ``2×2`` blocks. Avoids Qiskit ``Operator`` on a 9-controlled ``R_y``
+    cascade (minutes at ``n_d=9``).
+    """
+    values = np.asarray(payload, dtype=float).ravel()
+    if values.size == 0:
+        raise ValueError("payload must be non-empty")
+    n_val = int(np.ceil(np.log2(values.size)))
+    angles = 2.0 * np.arccos(np.clip(np.abs(values) / float(alpha), 0.0, 1.0))
+    dim = 1 << (1 + n_d)
+    mat = np.zeros((dim, dim), dtype=complex)
+    mask = (1 << n_val) - 1 if n_val > 0 else 0
+    phi0 = float(angles[0])
+    for d in range(1 << n_d):
+        low = d & mask
+        phi = float(angles[low]) if low < values.size else phi0
+        c = np.cos(0.5 * phi)
+        s = np.sin(0.5 * phi)
+        i0 = d << 1
+        i1 = i0 + 1
+        # R_y(phi) on the data LSB, identity on d.
+        mat[i0, i0] = c
+        mat[i1, i0] = s
+        mat[i0, i1] = -s
+        mat[i1, i1] = c
+    return mat
 
 
 def odata_amplitude_errors(
@@ -5271,4 +5890,349 @@ def format_freeze_comparison_tables(
         "lookup_gates": lookup_gates,
         "arith_gates": arith_gates,
         "winners": winners,
+    }
+
+
+# ---------------------------------------------------------------------------
+# (D) Paper-facing Jacobi–Anger QSVT polynomial on clinic H (elastic_wave_demo)
+# ---------------------------------------------------------------------------
+
+
+def _load_elastic_wave_chebyshev():
+    """Import Jacobi–Anger helpers from ``elastic_wave_demo/chebyshev_hamiltonian.py``."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    mod_name = "elastic_wave_chebyshev_hamiltonian"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    path = Path(__file__).resolve().parent / "elastic_wave_demo" / "chebyshev_hamiltonian.py"
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing elastic_wave_demo Chebyshev module: {path}")
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    # dataclasses need the module registered before exec_module.
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def ricker_vx_phi(
+    layout: Elastic3DLayout,
+    *,
+    dx: float = 0.05,
+    f0: float = 1.0,
+    x0: float = 0.0,
+    y0: float = 0.0,
+    z0: float | None = None,
+) -> np.ndarray:
+    """
+    Paper-style 3D Ricker wavelet on staggered ``v_x`` (other components zero).
+
+    Domain is centered at the origin with spacing ``dx`` on each axis, matching
+    ``[-L/2, L/2]^3`` with ``L = (n-1) dx``. Default source sits near the bottom
+    (``z0 = 0.9 * z_min``), as in the clinic / paper Ricker IC.
+    """
+    from _utility import Ricker
+
+    nx, ny, nz = layout.nx, layout.ny, layout.nz
+    xmin = -0.5 * dx * (nx - 1)
+    xmax = 0.5 * dx * (nx - 1)
+    ymin = -0.5 * dx * (ny - 1)
+    ymax = 0.5 * dx * (ny - 1)
+    zmin = -0.5 * dx * (nz - 1)
+    zmax = 0.5 * dx * (nz - 1)
+    if z0 is None:
+        z0 = 0.9 * zmin
+
+    x_vx = np.linspace(xmin + dx / 2, xmax - dx / 2, nx - 1)
+    y_vx = np.linspace(ymin, ymax, ny)
+    z_vx = np.linspace(zmin, zmax, nz)
+    # Match FD layout flatten order: x-fastest within each z-layer of v_x.
+    X_vx, Y_vx, Z_vx = np.meshgrid(x_vx, y_vx, z_vx, indexing="ij")
+    ricker_vx = Ricker(f0, X_vx, Y_vx, Z_vx, x0, y0, z0)
+
+    phi = np.zeros(layout.n_total, dtype=float)
+    phi[layout.vx_slice] = np.round(ricker_vx, 20).ravel(order="F")
+    return phi
+
+
+def evolve_state_jacobi_anger_qsvt(
+    hamiltonian: sp.spmatrix | np.ndarray,
+    psi0: np.ndarray,
+    time: float,
+    *,
+    alpha: float | None = None,
+    tol: float = 1e-10,
+    degree: int | None = None,
+) -> dict[str, object]:
+    """
+    Classical QSVT target polynomial via Jacobi–Anger / Bessel coefficients.
+
+    Applies ``chebyshev_evolve`` from ``elastic_wave_demo`` to the encoded block
+    ``K = H/α`` with ``spectral_bounds=(-1, 1)`` and ``sign=-1`` (forward
+    ``e^{-iHt}``). Degree is chosen by the demo's DLMF Bessel tail bound unless
+    ``degree`` is set. This is the same polynomial QSVT would synthesize; it is
+    **not** a Statevector simulation of Pechan ``U_H`` queries.
+    """
+    cheb = _load_elastic_wave_chebyshev()
+    h = sp.csr_matrix(hamiltonian, dtype=complex)
+    psi = np.asarray(psi0, dtype=complex).ravel()
+    if psi.shape[0] != h.shape[0]:
+        raise ValueError("psi0 length must match Hamiltonian dimension.")
+    alpha_val = float(spectral_norm_hermitian_sparse(h) if alpha is None else alpha)
+    if alpha_val <= 0:
+        alpha_val = 1.0
+
+    def k_apply(v: np.ndarray) -> np.ndarray:
+        return np.asarray(h @ v, dtype=complex) / alpha_val
+
+    psi_t, info = cheb.chebyshev_evolve(
+        k_apply,
+        psi,
+        alpha_val * float(time),
+        spectral_bounds=(-1.0, 1.0),
+        tol=float(tol),
+        degree=degree,
+        sign=-1,
+    )
+    return {
+        "psi_t": np.asarray(psi_t, dtype=complex),
+        "alpha": alpha_val,
+        "time": float(time),
+        "degree": int(info.degree),
+        "tail_bound": float(info.tail_bound),
+        "scaled_time": float(info.scaled_time),
+        "h_calls": int(info.h_calls),
+        "tol": float(tol),
+    }
+
+
+def compare_clinic_jacobi_anger_qsvt(
+    nx: int,
+    ny: int,
+    nz: int,
+    *,
+    add_fractures: bool = True,
+    dx: float = 0.05,
+    time: float | None = None,
+    evol_phase: float = 1.0,
+    tol: float = 1e-8,
+    degree: int | None = None,
+    z_layers: tuple[tuple[int, int], ...] | None = None,
+    alpha: float | None = None,
+) -> dict[str, object]:
+    """
+    Ricker IC + Jacobi–Anger QSVT poly on clinic ``H/α`` vs sparse ``expm``.
+
+    Reports state error against ``evolve_state_sparse`` and layer subvolume
+    energies (kinetic / potential / total) for each ``(z_min, z_max)`` slab.
+    """
+    demo = build_clinic_sparse_hamiltonian(
+        nx, ny, nz, add_fractures=add_fractures, dx=dx
+    )
+    layout = demo["layout"]
+    h = sp.csr_matrix(demo["H"], dtype=complex)
+    t_evol = (
+        float(time)
+        if time is not None
+        else recommended_evolution_time(h, phase=evol_phase)
+    )
+    phi0 = ricker_vx_phi(layout, dx=dx)
+    psi0 = prepare_energy_basis_psi0(phi0, demo["B_sqrt"])
+
+    ja = evolve_state_jacobi_anger_qsvt(
+        h, psi0, t_evol, alpha=alpha, tol=tol, degree=degree
+    )
+    psi_ref = evolve_state_sparse(h, psi0, t_evol)
+    err = float(np.linalg.norm(ja["psi_t"] - psi_ref))
+    norm_drift = float(abs(np.linalg.norm(ja["psi_t"]) - 1.0))
+
+    if z_layers is None:
+        if nz >= 5:
+            z_layers = tuple((z, z + 1) for z in range(min(5, nz - 1)))
+        else:
+            z_layers = tuple((z, z + 1) for z in range(max(nz - 1, 1)))
+
+    energy_rows: list[dict[str, object]] = []
+    for z_min, z_max in z_layers:
+        mask = build_z_layer_subvolume_mask(layout, z_min, z_max)
+        masks = kinetic_potential_total_masks(mask, layout)
+        e_ja = subvolume_energy_table(masks, ja["psi_t"], dx=dx, dy=dx, dz=dx)
+        e_ref = subvolume_energy_table(masks, psi_ref, dx=dx, dy=dx, dz=dx)
+        for kind in ("kinetic", "potential", "total"):
+            energy_rows.append(
+                {
+                    "nx": nx,
+                    "ny": ny,
+                    "nz": nz,
+                    "z_min": z_min,
+                    "z_max": z_max,
+                    "kind": kind,
+                    "jacobi_anger": e_ja[kind],
+                    "sparse_expm": e_ref[kind],
+                    "abs_err": abs(e_ja[kind] - e_ref[kind]),
+                }
+            )
+
+    return {
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "N_s": int(layout.n_total),
+        "add_fractures": add_fractures,
+        "dx": float(dx),
+        "time": t_evol,
+        "alpha": float(ja["alpha"]),
+        "degree": int(ja["degree"]),
+        "tail_bound": float(ja["tail_bound"]),
+        "scaled_time": float(ja["scaled_time"]),
+        "h_calls": int(ja["h_calls"]),
+        "tol": float(tol),
+        "state_err_vs_expm": err,
+        "norm_drift": norm_drift,
+        "psi0_support": int(np.count_nonzero(np.abs(phi0) > 0)),
+        "energy_table": pd.DataFrame(energy_rows),
+        "psi_jacobi_anger": ja["psi_t"],
+        "psi_expm": psi_ref,
+        "psi0": psi0,
+        "H": h,
+        "layout": layout,
+    }
+
+
+def compare_jacobi_anger_poly_to_sparse_uh(
+    *,
+    add_fractures: bool = True,
+    dx: float = 0.05,
+    time: float | None = None,
+    evol_phase: float = 1.0,
+    tol: float = 1e-8,
+    degree: int | None = None,
+    z_min: int = 0,
+    z_max: int = 1,
+) -> dict[str, object]:
+    """
+    ``2×2×2`` check: Jacobi–Anger poly on ``H/α`` matches sparse-``U_H`` content.
+
+    Pechan ``U_H`` encodes ``Im(H)/α`` (clinic ``H`` is purely imaginary
+    Hermitian, so ``H/α = i·Im(H)/α``). This routine:
+
+    1. builds sparse CSR ``U_H`` (§7b) and checks unitarity + oracle content;
+    2. applies the same Jacobi–Anger polynomial via matvecs of clinic ``H/α``;
+    3. applies that same polynomial via matvecs of ``i·(Im(H)/α)`` reconstructed
+       from the Pechan ``(d,m)`` tables that define ``U_H``;
+    4. compares both to sparse ``expm(-iHt)`` and reports bottom-layer energies.
+
+    This ties the classical QSVT target polynomial to the sparse block encoding
+    without Statevector-simulating a degree-``d`` QSVT circuit on 15 qubits.
+    """
+    cheb = _load_elastic_wave_chebyshev()
+    demo = build_minimal_hamiltonian_demo(
+        2, 2, 2, add_fractures=add_fractures, dx=dx
+    )
+    oracle = demo["oracle"]
+    layout = demo["layout"]
+    h = sp.csr_matrix(demo["H"], dtype=complex)
+    uh, alpha_uh = build_sparse_uh_matrix(oracle)
+    uh_rep = compare_sparse_uh_to_classical(oracle)
+    uh_content = compare_uh_to_classical(oracle)
+
+    # BE payload is Im(H)/α; clinic H = i Im(H) entrywise ⇒ H/α = i · Im(H)/α.
+    im_over_alpha = reconstructed_normalized_hamiltonian(oracle, alpha_uh, use_imag=True)
+    k_from_uh = 1j * np.asarray(im_over_alpha, dtype=complex)
+    k_from_h = (h / float(alpha_uh)).toarray()
+    k_match_err = float(np.max(np.abs(k_from_uh - k_from_h)))
+
+    t_evol = (
+        float(time)
+        if time is not None
+        else recommended_evolution_time(h, phase=evol_phase)
+    )
+    phi0 = ricker_vx_phi(layout, dx=dx)
+    psi0 = prepare_energy_basis_psi0(phi0, demo["B_sqrt"])
+
+    def k_h_apply(v: np.ndarray) -> np.ndarray:
+        return np.asarray(h @ v, dtype=complex) / float(alpha_uh)
+
+    def k_uh_apply(v: np.ndarray) -> np.ndarray:
+        return k_from_uh @ np.asarray(v, dtype=complex)
+
+    psi_h, info_h = cheb.chebyshev_evolve(
+        k_h_apply,
+        psi0,
+        float(alpha_uh) * t_evol,
+        spectral_bounds=(-1.0, 1.0),
+        tol=float(tol),
+        degree=degree,
+        sign=-1,
+    )
+    # Reuse the exact coefficient list from the H/α run.
+    coeffs = cheb.exponential_coefficients(
+        info_h.scaled_time, info_h.degree, sign=-1
+    )
+    psi_uh = cheb.chebyshev_action(k_uh_apply, psi0, coeffs)
+    psi_ref = evolve_state_sparse(h, psi0, t_evol)
+
+    mask = build_z_layer_subvolume_mask(layout, z_min, z_max)
+    masks = kinetic_potential_total_masks(mask, layout)
+    energies = {
+        "jacobi_anger_H": subvolume_energy_table(
+            masks, psi_h, dx=dx, dy=dx, dz=dx
+        ),
+        "jacobi_anger_UH_content": subvolume_energy_table(
+            masks, psi_uh, dx=dx, dy=dx, dz=dx
+        ),
+        "sparse_expm": subvolume_energy_table(
+            masks, psi_ref, dx=dx, dy=dx, dz=dx
+        ),
+    }
+    energy_rows = []
+    for kind in ("kinetic", "potential", "total"):
+        energy_rows.append(
+            {
+                "kind": kind,
+                "jacobi_anger_H": energies["jacobi_anger_H"][kind],
+                "jacobi_anger_UH_content": energies["jacobi_anger_UH_content"][kind],
+                "sparse_expm": energies["sparse_expm"][kind],
+                "err_H_vs_expm": abs(
+                    energies["jacobi_anger_H"][kind] - energies["sparse_expm"][kind]
+                ),
+                "err_UH_vs_H": abs(
+                    energies["jacobi_anger_UH_content"][kind]
+                    - energies["jacobi_anger_H"][kind]
+                ),
+            }
+        )
+
+    # One sparse-U_H query fingerprint: apply U_H to |0_data 0_d 0_m j>, read
+    # unitarity already in uh_rep; here record CSR size + content errors.
+    return {
+        "N_s": int(layout.n_total),
+        "n_qubits_uh": int(oracle.num_qubits_uh),
+        "alpha_uh": float(alpha_uh),
+        "time": t_evol,
+        "tol": float(tol),
+        "degree": int(info_h.degree),
+        "tail_bound": float(info_h.tail_bound),
+        "scaled_time": float(info_h.scaled_time),
+        "h_calls": int(info_h.h_calls),
+        "uh_csr_MB": float(uh_rep["uh_csr_MB"]),
+        "uh_unitarity_err": float(uh_rep["unitarity_err"]),
+        "uh_classical_recon_error": float(uh_content["classical_recon_error"]),
+        "uh_odata_amp_error": float(uh_content["odata_amp_error"]),
+        "K_uh_content_vs_H_over_alpha": k_match_err,
+        "state_err_H_vs_expm": float(np.linalg.norm(psi_h - psi_ref)),
+        "state_err_UH_vs_H": float(np.linalg.norm(psi_uh - psi_h)),
+        "state_err_UH_vs_expm": float(np.linalg.norm(psi_uh - psi_ref)),
+        "norm_drift_H": float(abs(np.linalg.norm(psi_h) - 1.0)),
+        "energy_table": pd.DataFrame(energy_rows),
+        "psi_H": np.asarray(psi_h, dtype=complex),
+        "psi_UH": np.asarray(psi_uh, dtype=complex),
+        "psi_expm": psi_ref,
+        "uh_sparse": uh,
+        "oracle": oracle,
     }
